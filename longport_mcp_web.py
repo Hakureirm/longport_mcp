@@ -1413,13 +1413,23 @@ def search_symbol(query: str) -> str:
 @mcp.tool()
 def get_quote(symbols: list[str]) -> str:
     """
-    获取股票实时行情。
+    获取股票/加密货币实时行情。查股价、看行情、查走势用这个工具。
+
+    支持的格式：
+    - 美股: AAPL.US, TSLA.US, NVDA.US
+    - 港股: 700.HK, 9988.HK
+    - 加密货币: BTC-USD, ETH-USD, DOGE-USD (注意用横杠连接，不是BTCUSD)
+
+    常用代码：
+    - 苹果: AAPL.US | 特斯拉: TSLA.US | 英伟达: NVDA.US
+    - 腾讯: 700.HK | 阿里: 9988.HK
+    - 比特币: BTC-USD | 以太坊: ETH-USD | 狗狗币: DOGE-USD
 
     Args:
-        symbols: 股票代码列表（如 ["AAPL.US", "700.HK"]）
+        symbols: 代码列表，如 ["AAPL.US", "BTC-USD"]
 
     Returns:
-        行情信息
+        行情信息（价格、涨跌幅）
     """
     # 首先尝试长桥 API
     try:
