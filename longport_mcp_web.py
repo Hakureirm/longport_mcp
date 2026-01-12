@@ -36,7 +36,7 @@ except ImportError:
 
 # 尝试导入 longport SDK（用于高级功能）
 try:
-    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period
+    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period, AdjustType
     HAS_SDK = True
 except ImportError:
     HAS_SDK = False
@@ -94,22 +94,73 @@ class LongportClient:
     2. 生成符合文档要求的签名 Header
     3. 封装 GET/POST/PUT/DELETE 方法
     4. 处理 JSON 序列化和错误回显
+
+    配置文件格式（支持双账户）：
+    {
+        "paper": {
+            "app_key": "xxx",
+            "app_secret": "xxx",
+            "access_token": "xxx"
+        },
+        "real": {
+            "app_key": "xxx",
+            "app_secret": "xxx",
+            "access_token": "xxx"
+        },
+        "default_mode": "paper"
+    }
+
+    也支持旧的单账户格式（向后兼容）：
+    {
+        "app_key": "xxx",
+        "app_secret": "xxx",
+        "access_token": "xxx"
+    }
     """
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, mode: str = "paper"):
         """
         初始化客户端
 
         Args:
             config_path: 配置文件路径，默认为当前目录下的 longport_config.json
+            mode: 账户模式，"paper"=模拟盘，"real"=实盘
+
+        支持的环境变量（双账户模式）：
+            LONGPORT_PAPER_APP_KEY, LONGPORT_PAPER_APP_SECRET, LONGPORT_PAPER_ACCESS_TOKEN
+            LONGPORT_REAL_APP_KEY, LONGPORT_REAL_APP_SECRET, LONGPORT_REAL_ACCESS_TOKEN
+            LONGPORT_DEFAULT_MODE (可选，默认 "paper")
+
+        也支持旧的单账户环境变量：
+            LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
         """
+        self.mode = mode
         self.config = self._load_config(config_path)
-        self.app_key = self.config.get("app_key") or os.getenv("LONGPORT_APP_KEY")
-        self.app_secret = self.config.get("app_secret") or os.getenv("LONGPORT_APP_SECRET")
-        self.access_token = self.config.get("access_token") or os.getenv("LONGPORT_ACCESS_TOKEN")
+
+        # 优先级: 1. 配置文件 2. 带模式前缀的环境变量 3. 旧环境变量
+
+        # 检查是否为新格式配置文件（双账户）
+        if "paper" in self.config or "real" in self.config:
+            mode_config = self.config.get(mode, {})
+            self.app_key = mode_config.get("app_key")
+            self.app_secret = mode_config.get("app_secret")
+            self.access_token = mode_config.get("access_token")
+        else:
+            self.app_key = self.config.get("app_key")
+            self.app_secret = self.config.get("app_secret")
+            self.access_token = self.config.get("access_token")
+
+        # 如果配置文件没有，尝试环境变量（带模式前缀）
+        mode_upper = mode.upper()
+        if not self.app_key:
+            self.app_key = os.getenv(f"LONGPORT_{mode_upper}_APP_KEY") or os.getenv("LONGPORT_APP_KEY")
+        if not self.app_secret:
+            self.app_secret = os.getenv(f"LONGPORT_{mode_upper}_APP_SECRET") or os.getenv("LONGPORT_APP_SECRET")
+        if not self.access_token:
+            self.access_token = os.getenv(f"LONGPORT_{mode_upper}_ACCESS_TOKEN") or os.getenv("LONGPORT_ACCESS_TOKEN")
 
         if not all([self.app_key, self.app_secret, self.access_token]):
-            raise ValueError("缺少必要的配置: app_key, app_secret, access_token")
+            raise ValueError(f"缺少必要的配置 ({mode}): app_key, app_secret, access_token")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -704,29 +755,117 @@ class LongportClient:
 
 
 # ================= 全局客户端实例 =================
-_client: Optional[LongportClient] = None
-_quote_ctx = None  # SDK QuoteContext
+_current_mode: str = "paper"  # 当前账户模式: "paper" 或 "real"
+_paper_client: Optional[LongportClient] = None
+_real_client: Optional[LongportClient] = None
+_paper_quote_ctx = None  # SDK QuoteContext for paper trading
+_real_quote_ctx = None   # SDK QuoteContext for real trading
+
+
+def _load_default_mode() -> str:
+    """从环境变量或配置文件加载默认模式"""
+    # 优先使用环境变量
+    env_mode = os.getenv("LONGPORT_DEFAULT_MODE", "").lower()
+    if env_mode in ["paper", "real"]:
+        return env_mode
+
+    # 其次从配置文件加载
+    paths_to_try = [
+        CONFIG_FILE,
+        os.path.join(os.path.dirname(__file__), CONFIG_FILE),
+        os.path.expanduser(f"~/{CONFIG_FILE}"),
+    ]
+    for path in paths_to_try:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    return config.get("default_mode", "paper")
+            except Exception:
+                pass
+    return "paper"
+
+
+def get_current_mode() -> str:
+    """获取当前账户模式"""
+    return _current_mode
+
+
+def set_current_mode(mode: str) -> bool:
+    """
+    设置当前账户模式
+
+    Args:
+        mode: "paper" 或 "real"
+
+    Returns:
+        是否成功
+    """
+    global _current_mode
+    if mode not in ["paper", "real"]:
+        return False
+    _current_mode = mode
+    return True
+
 
 def get_client() -> LongportClient:
-    """获取全局 REST API 客户端实例（懒加载）"""
-    global _client
-    if _client is None:
-        _client = LongportClient()
-    return _client
+    """获取当前模式的 REST API 客户端实例（懒加载）"""
+    global _paper_client, _real_client, _current_mode
+
+    if _current_mode == "paper":
+        if _paper_client is None:
+            _paper_client = LongportClient(mode="paper")
+        return _paper_client
+    else:
+        if _real_client is None:
+            _real_client = LongportClient(mode="real")
+        return _real_client
+
 
 def get_quote_context():
-    """获取 SDK QuoteContext 实例（懒加载）"""
-    global _quote_ctx
+    """获取当前模式的 SDK QuoteContext 实例（懒加载）"""
+    global _paper_quote_ctx, _real_quote_ctx, _current_mode
+
     if not HAS_SDK:
         return None
-    if _quote_ctx is None:
-        try:
-            config = Config.from_env()
-            _quote_ctx = QuoteContext(config)
-        except Exception as e:
-            logger.error(f"SDK QuoteContext 初始化失败: {e}")
-            return None
-    return _quote_ctx
+
+    # 根据当前模式选择对应的 context
+    if _current_mode == "paper":
+        if _paper_quote_ctx is None:
+            try:
+                client = get_client()
+                logger.info(f"SDK初始化 (paper): app_key={client.app_key[:8] if client.app_key else 'None'}...")
+                config = Config(
+                    app_key=client.app_key,
+                    app_secret=client.app_secret,
+                    access_token=client.access_token
+                )
+                _paper_quote_ctx = QuoteContext(config)
+                logger.info("SDK QuoteContext (paper) 初始化成功")
+            except Exception as e:
+                logger.error(f"SDK QuoteContext (paper) 初始化失败: {e}")
+                return None
+        return _paper_quote_ctx
+    else:
+        if _real_quote_ctx is None:
+            try:
+                client = get_client()
+                logger.info(f"SDK初始化 (real): app_key={client.app_key[:8] if client.app_key else 'None'}...")
+                config = Config(
+                    app_key=client.app_key,
+                    app_secret=client.app_secret,
+                    access_token=client.access_token
+                )
+                _real_quote_ctx = QuoteContext(config)
+                logger.info("SDK QuoteContext (real) 初始化成功")
+            except Exception as e:
+                logger.error(f"SDK QuoteContext (real) 初始化失败: {e}")
+                return None
+        return _real_quote_ctx
+
+
+# 初始化时加载默认模式
+_current_mode = _load_default_mode()
 # =================================================
 
 
@@ -779,6 +918,40 @@ def to_sdk_symbol(symbol: str) -> str:
     if s.startswith("HK."):
         return f"{int(s[3:])}.HK"
 
+    return s
+
+
+def to_yahoo_symbol(symbol: str) -> str:
+    """
+    转换长桥格式代码为 Yahoo Finance 格式
+
+    Examples:
+        AAPL.US -> AAPL
+        700.HK -> 0700.HK
+        600519.SH -> 600519.SS
+        000001.SZ -> 000001.SZ
+    """
+    s = symbol.upper().strip()
+
+    # 美股：去掉 .US 后缀
+    if s.endswith(".US"):
+        return s.replace(".US", "")
+
+    # 港股：补齐4位数字
+    if s.endswith(".HK"):
+        parts = s.split(".")
+        code = parts[0].zfill(4)  # 补齐前导零
+        return f"{code}.HK"
+
+    # 上证：.SH -> .SS
+    if s.endswith(".SH"):
+        return s.replace(".SH", ".SS")
+
+    # 深证：保持不变
+    if s.endswith(".SZ"):
+        return s
+
+    # 其他情况原样返回
     return s
 
 
@@ -1071,10 +1244,13 @@ def place_order(
     Returns:
         交易结果
     """
+    mode = get_current_mode()
+    mode_label = "[模拟盘]" if mode == "paper" else "[实盘]"
+
     result = _core_execute_trade(symbol, side, quantity, price, "Manual")
     if result:
-        return f"[OK] 订单已提交，ID: {result}"
-    return "[X] 下单失败，请检查日志"
+        return f"{mode_label} [OK] 订单已提交，ID: {result}"
+    return f"{mode_label} [X] 下单失败，请检查日志"
 
 
 # ------------------------------------------
@@ -1265,13 +1441,23 @@ def search_symbol(query: str) -> str:
 @mcp.tool()
 def get_quote(symbols: list[str]) -> str:
     """
-    获取股票实时行情。
+    获取股票/加密货币实时行情。查股价、看行情、查走势用这个工具。
+
+    支持的格式：
+    - 美股: AAPL.US, TSLA.US, NVDA.US
+    - 港股: 700.HK, 9988.HK
+    - 加密货币: BTC-USD, ETH-USD, DOGE-USD (注意用横杠连接，不是BTCUSD)
+
+    常用代码：
+    - 苹果: AAPL.US | 特斯拉: TSLA.US | 英伟达: NVDA.US
+    - 腾讯: 700.HK | 阿里: 9988.HK
+    - 比特币: BTC-USD | 以太坊: ETH-USD | 狗狗币: DOGE-USD
 
     Args:
-        symbols: 股票代码列表（如 ["AAPL.US", "700.HK"]）
+        symbols: 代码列表，如 ["AAPL.US", "BTC-USD"]
 
     Returns:
-        行情信息
+        行情信息（价格、涨跌幅）
     """
     # 首先尝试长桥 API
     try:
@@ -1908,49 +2094,99 @@ def get_margin_ratio(symbol: str) -> str:
 
 
 # ------------------------------------------
-# 工具 23: 获取K线数据
+# 工具 23: 获取K线数据（SDK优先，yfinance备用）
 # ------------------------------------------
 @mcp.tool()
 def get_candlesticks(
     symbol: str,
     period: str = "1d",
-    count: int = 100
+    count: int = 30
 ) -> str:
     """
-    获取K线数据。
+    获取K线数据。优先使用 SDK，失败时使用 yfinance 备用。
 
     Args:
-        symbol: 股票代码
-        period: K线周期 (1m/5m/15m/30m/60m/1d/1w/1M/1y)
-        count: K线数量（最大1000）
+        symbol: 股票代码（如 AAPL.US, 700.HK, ORCL.US）
+        period: K线周期 (1d=日线, 1w=周线, 1M=月线)
+        count: K线数量（默认30根）
 
     Returns:
-        K线数据
+        K线数据（开高低收+成交量）
     """
+    target = to_sdk_symbol(symbol)
+
+    # 优先尝试 SDK
+    if HAS_SDK:
+        try:
+            ctx = get_quote_context()
+            if ctx is not None:
+                # SDK Period 映射
+                period_map = {
+                    "1m": Period.Min_1, "5m": Period.Min_5, "15m": Period.Min_15,
+                    "30m": Period.Min_30, "60m": Period.Min_60,
+                    "1d": Period.Day, "day": Period.Day,
+                    "1w": Period.Week, "week": Period.Week,
+                    "1M": Period.Month, "month": Period.Month,
+                    "1y": Period.Year, "year": Period.Year,
+                }
+                sdk_period = period_map.get(period.lower(), Period.Day)
+
+                candles = ctx.candlesticks(target, sdk_period, count, AdjustType.ForwardAdjust)
+
+                if candles:
+                    results = [f"**{target} {period} K线 (SDK, 最近{len(candles)}根)**"]
+                    for c in candles[-count:]:
+                        date_str = c.timestamp.strftime("%Y-%m-%d")
+                        o = f"{c.open:.2f}"
+                        h = f"{c.high:.2f}"
+                        l = f"{c.low:.2f}"
+                        close = f"{c.close:.2f}"
+                        v = f"{int(c.volume):,}"
+                        results.append(f"  {date_str}: O:{o} H:{h} L:{l} C:{close} V:{v}")
+                    return "\n".join(results)
+        except Exception as e:
+            logger.warning(f"SDK K线获取失败，切换到 yfinance: {e}")
+
+    # yfinance 备用
+    if not HAS_YFINANCE:
+        return "[X] 无法获取K线: SDK不可用且yfinance未安装"
+
     try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_candlesticks(target, period, count)
+        yahoo_symbol = to_yahoo_symbol(target)
 
-        candles = resp.get("data", {}).get("candlesticks", [])
+        # yfinance 周期映射
+        interval_map = {
+            "1d": "1d", "day": "1d", "daily": "1d",
+            "1w": "1wk", "1wk": "1wk", "week": "1wk", "weekly": "1wk",
+            "1m": "1mo", "1mo": "1mo", "1M": "1mo", "month": "1mo", "monthly": "1mo",
+        }
+        interval = interval_map.get(period.lower(), "1d")
 
-        if not candles:
-            return "[i] 无K线数据"
+        # 根据周期决定获取多长时间的数据
+        if interval == "1d":
+            period_str = f"{min(count, 60)}d"
+        elif interval == "1wk":
+            period_str = f"{min(count * 7, 365)}d"
+        else:
+            period_str = f"{min(count * 30, 730)}d"
 
-        results = [f"**{target} {period} K线 (最近{len(candles)}根)**"]
+        ticker = yf.Ticker(yahoo_symbol)
+        df = ticker.history(period=period_str, interval=interval)
 
-        # 显示最近5根K线
-        for c in candles[-5:]:
-            o = c.get("open", "")
-            h = c.get("high", "")
-            l = c.get("low", "")
-            close = c.get("close", "")
-            vol = c.get("volume", "")
-            ts = c.get("timestamp", "")
-            results.append(f"  {ts}: O:{o} H:{h} L:{l} C:{close} V:{vol}")
+        if df.empty:
+            return f"[X] 无K线数据: {symbol}"
 
-        if len(candles) > 5:
-            results.append(f"  ... 共 {len(candles)} 根K线")
+        df = df.tail(count)
+        results = [f"**{target} {period} K线 (yfinance, 最近{len(df)}根)**"]
+
+        for idx, row in df.iterrows():
+            date_str = idx.strftime("%Y-%m-%d")
+            o = f"{row['Open']:.2f}"
+            h = f"{row['High']:.2f}"
+            l = f"{row['Low']:.2f}"
+            c = f"{row['Close']:.2f}"
+            v = f"{int(row['Volume']):,}"
+            results.append(f"  {date_str}: O:{o} H:{h} L:{l} C:{c} V:{v}")
 
         return "\n".join(results)
 
@@ -1964,7 +2200,7 @@ def get_candlesticks(
 @mcp.tool()
 def get_depth(symbol: str) -> str:
     """
-    获取盘口深度（买卖盘）。
+    获取盘口深度（买卖盘）。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -1972,28 +2208,28 @@ def get_depth(symbol: str) -> str:
     Returns:
         盘口深度信息
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_depth(target)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        data = resp.get("data", {})
-        asks = data.get("ask", [])
-        bids = data.get("bid", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.depth(target)
 
         results = [f"**{target} 盘口深度**"]
 
-        results.append("  卖盘:")
-        for a in asks[:5]:
-            price = a.get("price", "")
-            vol = a.get("volume", "")
-            results.append(f"    {price} x {vol}")
+        if hasattr(resp, 'asks') and resp.asks:
+            results.append("  卖盘:")
+            for a in resp.asks[:5]:
+                results.append(f"    {a.price} x {a.volume}")
 
-        results.append("  买盘:")
-        for b in bids[:5]:
-            price = b.get("price", "")
-            vol = b.get("volume", "")
-            results.append(f"    {price} x {vol}")
+        if hasattr(resp, 'bids') and resp.bids:
+            results.append("  买盘:")
+            for b in resp.bids[:5]:
+                results.append(f"    {b.price} x {b.volume}")
 
         return "\n".join(results)
 
@@ -2007,7 +2243,7 @@ def get_depth(symbol: str) -> str:
 @mcp.tool()
 def get_brokers(symbol: str) -> str:
     """
-    获取经纪商队列（港股专用）。
+    获取经纪商队列（港股专用）。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -2015,28 +2251,30 @@ def get_brokers(symbol: str) -> str:
     Returns:
         经纪商队列信息
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_brokers(target)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        data = resp.get("data", {})
-        ask_brokers = data.get("ask_brokers", [])
-        bid_brokers = data.get("bid_brokers", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.brokers(target)
 
         results = [f"**{target} 经纪商队列**"]
 
-        results.append("  卖方经纪商:")
-        for b in ask_brokers[:5]:
-            price = b.get("price", "")
-            broker_ids = b.get("broker_ids", [])
-            results.append(f"    {price}: {broker_ids[:3]}...")
+        if hasattr(resp, 'ask_brokers') and resp.ask_brokers:
+            results.append("  卖方经纪商:")
+            for b in resp.ask_brokers[:5]:
+                broker_ids = b.broker_ids if hasattr(b, 'broker_ids') else []
+                results.append(f"    {broker_ids[:5]}")
 
-        results.append("  买方经纪商:")
-        for b in bid_brokers[:5]:
-            price = b.get("price", "")
-            broker_ids = b.get("broker_ids", [])
-            results.append(f"    {price}: {broker_ids[:3]}...")
+        if hasattr(resp, 'bid_brokers') and resp.bid_brokers:
+            results.append("  买方经纪商:")
+            for b in resp.bid_brokers[:5]:
+                broker_ids = b.broker_ids if hasattr(b, 'broker_ids') else []
+                results.append(f"    {broker_ids[:5]}")
 
         return "\n".join(results)
 
@@ -2050,7 +2288,7 @@ def get_brokers(symbol: str) -> str:
 @mcp.tool()
 def get_trades(symbol: str, count: int = 20) -> str:
     """
-    获取最近成交明细。
+    获取最近成交明细。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -2059,22 +2297,27 @@ def get_trades(symbol: str, count: int = 20) -> str:
     Returns:
         成交明细
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_trades(target, count)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        trades = resp.get("data", {}).get("trades", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        trades = ctx.trades(target, count)
 
         if not trades:
             return "[i] 无成交明细"
 
         results = [f"**{target} 最近成交**"]
         for t in trades[:10]:
-            price = t.get("price", "")
-            vol = t.get("volume", "")
-            direction = t.get("direction", "")
-            ts = t.get("timestamp", "")
+            price = getattr(t, 'price', "")
+            vol = getattr(t, 'volume', "")
+            # direction 直接用 str() 转换，避免枚举类型问题
+            direction = str(getattr(t, 'direction', "")) if hasattr(t, 'direction') else ""
+            ts = getattr(t, 'timestamp', "")
             results.append(f"  {ts}: {price} x {vol} ({direction})")
 
         return "\n".join(results)
@@ -2089,7 +2332,7 @@ def get_trades(symbol: str, count: int = 20) -> str:
 @mcp.tool()
 def get_intraday(symbol: str) -> str:
     """
-    获取分时数据。
+    获取分时数据。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -2097,12 +2340,16 @@ def get_intraday(symbol: str) -> str:
     Returns:
         分时数据
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_intraday(target)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        lines = resp.get("data", {}).get("lines", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        lines = ctx.intraday(target)
 
         if not lines:
             return "[i] 无分时数据"
@@ -2111,9 +2358,9 @@ def get_intraday(symbol: str) -> str:
 
         # 显示最近10个点
         for l in lines[-10:]:
-            price = l.get("price", "")
-            vol = l.get("volume", "")
-            ts = l.get("timestamp", "")
+            price = l.price if hasattr(l, 'price') else ""
+            vol = l.volume if hasattr(l, 'volume') else ""
+            ts = l.timestamp if hasattr(l, 'timestamp') else ""
             results.append(f"  {ts}: {price} (成交量:{vol})")
 
         results.append(f"  ... 共 {len(lines)} 个数据点")
@@ -2649,6 +2896,86 @@ def check_sdk_status() -> str:
         results.append(f"  [X] REST API 初始化失败: {e}")
 
     return "\n".join(results)
+
+
+# ------------------------------------------
+# 工具 40: 获取当前账户模式
+# ------------------------------------------
+@mcp.tool()
+def get_account_mode() -> str:
+    """
+    获取当前账户模式（模拟盘/实盘）。
+
+    Returns:
+        当前模式信息
+    """
+    mode = get_current_mode()
+    mode_name = "模拟盘 (Paper Trading)" if mode == "paper" else "实盘 (Real Trading)"
+
+    try:
+        client = get_client()
+        status = "[OK] 已连接"
+    except Exception as e:
+        status = f"[X] 未连接: {e}"
+
+    return (
+        f"**当前账户模式**\n"
+        f"  模式: {mode_name}\n"
+        f"  状态: {status}\n"
+        f"\n"
+        f"切换模式请使用 switch_account_mode 工具"
+    )
+
+
+# ------------------------------------------
+# 工具 41: 切换账户模式
+# ------------------------------------------
+@mcp.tool()
+def switch_account_mode(mode: str) -> str:
+    """
+    切换账户模式（模拟盘/实盘）。
+
+    重要提示：
+    - paper: 模拟盘，用于测试和学习，不涉及真实资金
+    - real: 实盘，涉及真实资金交易，请谨慎操作！
+
+    Args:
+        mode: 目标模式，"paper"=模拟盘，"real"=实盘
+
+    Returns:
+        切换结果
+    """
+    mode = mode.lower().strip()
+
+    if mode not in ["paper", "real"]:
+        return "[X] 无效模式，请使用 'paper'(模拟盘) 或 'real'(实盘)"
+
+    old_mode = get_current_mode()
+    if old_mode == mode:
+        mode_name = "模拟盘" if mode == "paper" else "实盘"
+        return f"[i] 已经处于{mode_name}模式"
+
+    # 切换模式
+    if set_current_mode(mode):
+        if mode == "real":
+            return (
+                "**[!] 已切换到实盘模式**\n"
+                "\n"
+                "⚠️ 警告：您现在处于实盘交易模式！\n"
+                "  - 所有交易操作将使用真实资金\n"
+                "  - 请仔细核对每笔订单\n"
+                "  - 如需返回模拟盘，请使用 switch_account_mode('paper')"
+            )
+        else:
+            return (
+                "**[OK] 已切换到模拟盘模式**\n"
+                "\n"
+                "当前为模拟盘环境：\n"
+                "  - 所有交易为模拟操作\n"
+                "  - 不涉及真实资金"
+            )
+    else:
+        return "[X] 切换失败，请检查配置文件"
 
 
 # ================= 主入口 =================

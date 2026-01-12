@@ -1,6 +1,13 @@
 {
-    "app_key": "your_app_key_here",
-    "app_secret": "your_app_secret_here",
-    "access_token": "your_access_token_here",
-    "expiry": "2099-01-01"
+    "paper": {
+        "app_key": "your_paper_app_key",
+        "app_secret": "your_paper_app_secret",
+        "access_token": "your_paper_access_token"
+    },
+    "real": {
+        "app_key": "your_real_app_key",
+        "app_secret": "your_real_app_secret",
+        "access_token": "your_real_access_token"
+    },
+    "default_mode": "paper"
 }
