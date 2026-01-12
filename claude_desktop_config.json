@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "longport-trading": {
+      "command": "uvx",
+      "args": ["longport-mcp"],
+      "env": {
+        "LONGPORT_APP_KEY": "your_app_key_here",
+        "LONGPORT_APP_SECRET": "your_app_secret_here",
+        "LONGPORT_ACCESS_TOKEN": "your_access_token_here"
+      }
+    }
+  }
+}

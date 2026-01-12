@@ -1,0 +1,6 @@
+{
+    "app_key": "your_app_key_here",
+    "app_secret": "your_app_secret_here",
+    "access_token": "your_access_token_here",
+    "expiry": "2099-01-01"
+}
