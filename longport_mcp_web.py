@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Longport MCP Server - Web API Version
+Longport MCP Server - Hybrid Version
 =====================================
-基于 REST API 重写的长桥证券 MCP 服务，完全不依赖 longport SDK。
-使用 HMAC-SHA256 签名机制进行 API 鉴权。
+长桥证券 MCP 服务，支持 REST API + SDK 混合模式。
+- REST API: 交易、资产、持仓、订单
+- SDK (可选): 交易日历、资金流向、实时推送等高级功能
 
-配置文件: longport_config.json
-{
-    "app_key": "your_app_key",
-    "app_secret": "your_app_secret",
-    "access_token": "your_access_token"
-}
+配置方式：
+1. 环境变量（推荐）: LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
+2. 配置文件: longport_config.json
 """
 
 import sys
@@ -35,6 +33,13 @@ try:
     HAS_YFINANCE = True
 except ImportError:
     HAS_YFINANCE = False
+
+# 尝试导入 longport SDK（用于高级功能）
+try:
+    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period
+    HAS_SDK = True
+except ImportError:
+    HAS_SDK = False
 
 # ================= 配置区域 =================
 logging.basicConfig(
@@ -687,13 +692,28 @@ class LongportClient:
 
 # ================= 全局客户端实例 =================
 _client: Optional[LongportClient] = None
+_quote_ctx = None  # SDK QuoteContext
 
 def get_client() -> LongportClient:
-    """获取全局客户端实例（懒加载）"""
+    """获取全局 REST API 客户端实例（懒加载）"""
     global _client
     if _client is None:
         _client = LongportClient()
     return _client
+
+def get_quote_context():
+    """获取 SDK QuoteContext 实例（懒加载）"""
+    global _quote_ctx
+    if not HAS_SDK:
+        return None
+    if _quote_ctx is None:
+        try:
+            config = Config.from_env()
+            _quote_ctx = QuoteContext(config)
+        except Exception as e:
+            logger.error(f"SDK QuoteContext 初始化失败: {e}")
+            return None
+    return _quote_ctx
 # =================================================
 
 
@@ -2299,6 +2319,222 @@ def get_current_time() -> str:
         f"  UTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"  时间戳: {int(time.time())}"
     )
+
+
+# ==================== SDK 增强功能 ====================
+# 以下工具需要 longport SDK 支持，提供更丰富的行情数据
+
+# ------------------------------------------
+# 工具 36: 获取交易日历 (SDK)
+# ------------------------------------------
+@mcp.tool()
+def get_trading_days(
+    market: str = "US",
+    start_date: str = "",
+    end_date: str = ""
+) -> str:
+    """
+    获取交易日历（需要 SDK 支持）。
+
+    Args:
+        market: 市场代码（US/HK/CN/SG），默认 US
+        start_date: 开始日期 YYYY-MM-DD，默认为今天
+        end_date: 结束日期 YYYY-MM-DD，默认为30天后
+
+    Returns:
+        交易日列表
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+
+    try:
+        from datetime import date
+
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败，请检查环境变量配置"
+
+        # 默认日期
+        today = date.today()
+        if not start_date:
+            begin = today
+        else:
+            begin = date.fromisoformat(start_date)
+
+        if not end_date:
+            end = date(today.year, today.month + 1 if today.month < 12 else 1,
+                      today.day if today.month < 12 else today.day)
+            if today.month == 12:
+                end = date(today.year + 1, 1, today.day)
+        else:
+            end = date.fromisoformat(end_date)
+
+        # 市场映射
+        market_map = {
+            "US": Market.US,
+            "HK": Market.HK,
+            "CN": Market.CN,
+            "SG": Market.SG,
+        }
+        mkt = market_map.get(market.upper(), Market.US)
+
+        resp = ctx.trading_days(mkt, begin, end)
+
+        results = [f"**{market} 交易日历 ({begin} ~ {end})**"]
+
+        trading_days = resp.trading_days if hasattr(resp, 'trading_days') else []
+        half_trading_days = resp.half_trading_days if hasattr(resp, 'half_trading_days') else []
+
+        if trading_days:
+            results.append(f"  交易日数: {len(trading_days)}")
+            # 显示最近10个
+            days_str = [d.strftime("%Y-%m-%d") for d in trading_days[:10]]
+            results.append(f"  日期: {', '.join(days_str)}")
+            if len(trading_days) > 10:
+                results.append(f"  ... 共 {len(trading_days)} 个交易日")
+
+        if half_trading_days:
+            half_str = [d.strftime("%Y-%m-%d") for d in half_trading_days]
+            results.append(f"  半日交易: {', '.join(half_str)}")
+
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 交易日历查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具 37: 获取资金流向 (SDK)
+# ------------------------------------------
+@mcp.tool()
+def get_capital_flow(symbol: str) -> str:
+    """
+    获取个股当日资金流向（需要 SDK 支持）。
+
+    Args:
+        symbol: 股票代码
+
+    Returns:
+        资金流向信息
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败，请检查环境变量配置"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.capital_flow(target)
+
+        if not resp:
+            return f"[i] {target} 无资金流向数据"
+
+        results = [f"**{target} 资金流向**"]
+
+        # 显示最近5条
+        for line in resp[-5:]:
+            inflow = getattr(line, 'inflow', 0)
+            ts = getattr(line, 'timestamp', '')
+            results.append(f"  {ts}: 净流入 {inflow}")
+
+        if len(resp) > 5:
+            results.append(f"  ... 共 {len(resp)} 条记录")
+
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 资金流向查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具 38: 获取资金分布 (SDK)
+# ------------------------------------------
+@mcp.tool()
+def get_capital_distribution(symbol: str) -> str:
+    """
+    获取个股资金分布（需要 SDK 支持）。
+
+    Args:
+        symbol: 股票代码
+
+    Returns:
+        资金分布信息（大单/中单/小单）
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败，请检查环境变量配置"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.capital_distribution(target)
+
+        results = [f"**{target} 资金分布**"]
+
+        # 大单
+        large_in = getattr(resp, 'capital_in_large', 0)
+        large_out = getattr(resp, 'capital_out_large', 0)
+        results.append(f"  大单: 流入 {large_in}, 流出 {large_out}")
+
+        # 中单
+        medium_in = getattr(resp, 'capital_in_medium', 0)
+        medium_out = getattr(resp, 'capital_out_medium', 0)
+        results.append(f"  中单: 流入 {medium_in}, 流出 {medium_out}")
+
+        # 小单
+        small_in = getattr(resp, 'capital_in_small', 0)
+        small_out = getattr(resp, 'capital_out_small', 0)
+        results.append(f"  小单: 流入 {small_in}, 流出 {small_out}")
+
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 资金分布查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具 39: 检查 SDK 状态
+# ------------------------------------------
+@mcp.tool()
+def check_sdk_status() -> str:
+    """
+    检查 SDK 和各模块的可用状态。
+
+    Returns:
+        各模块状态信息
+    """
+    results = ["**模块状态检查**"]
+
+    # SDK 状态
+    if HAS_SDK:
+        results.append("  [OK] longport SDK 已安装")
+        ctx = get_quote_context()
+        if ctx:
+            results.append("  [OK] SDK QuoteContext 已初始化")
+        else:
+            results.append("  [X] SDK QuoteContext 初始化失败")
+    else:
+        results.append("  [X] longport SDK 未安装")
+        results.append("      安装命令: pip install longport")
+
+    # yfinance 状态
+    if HAS_YFINANCE:
+        results.append("  [OK] yfinance 已安装 (备用行情源)")
+    else:
+        results.append("  [i] yfinance 未安装 (可选)")
+
+    # REST API 状态
+    try:
+        client = get_client()
+        results.append("  [OK] REST API 客户端已初始化")
+    except Exception as e:
+        results.append(f"  [X] REST API 初始化失败: {e}")
+
+    return "\n".join(results)
 
 
 # ================= 主入口 =================
