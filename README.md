@@ -1,46 +1,68 @@
 # Longport MCP Server
 
-基于 REST API 的长桥证券 MCP (Model Context Protocol) 服务器，完全不依赖 longport SDK。
+长桥证券 MCP (Model Context Protocol) 服务器，让 AI Agent 能够进行股票交易、查询行情、管理资产。
 
 ## 特性
 
-- **无 SDK 依赖**: 直接使用 REST API，通过 HMAC-SHA256 签名进行鉴权
-- **34 个 MCP 工具**: 覆盖交易、资产、行情、期权/窝轮等全部功能
-- **stdio 协议**: 支持所有兼容 MCP 的 AI Agent
-- **uvx 部署**: 一键安装运行
+- **REST API + SDK 混合架构**: 核心交易功能使用 REST API，高级行情功能使用 SDK
+- **模拟盘/实盘切换**: 支持双账户配置，一键切换模拟盘和实盘
+- **41 个 MCP 工具**: 覆盖交易、资产、行情、期权/窝轮等全部功能
+- **yfinance 备用**: 行情数据支持 yfinance 作为备用源，可查询加密货币
+- **uvx 一键部署**: 无需复杂配置
 
 ## 快速开始
 
-### 方式 1: uvx (推荐)
+### 安装
 
 ```bash
-# 直接运行
+# 推荐：uvx 直接运行
 uvx longport-mcp
 
-# 或者安装后运行
-uv tool install longport-mcp
-longport-mcp
-```
-
-### 方式 2: pip 安装
-
-```bash
+# 或者 pip 安装
 pip install longport-mcp
-longport-mcp
 ```
 
-### 方式 3: 从源码运行
+### 配置
 
-```bash
-git clone https://github.com/Hakureirm/longport_mcp.git
-cd longport_mcp
-pip install -e .
-python longport_mcp_web.py
+#### 方式 1: 环境变量（支持双账户）
+
+```json
+{
+  "command": "uvx",
+  "args": ["longport-mcp"],
+  "env": {
+    "LONGPORT_PAPER_APP_KEY": "模拟盘 app_key",
+    "LONGPORT_PAPER_APP_SECRET": "模拟盘 app_secret",
+    "LONGPORT_PAPER_ACCESS_TOKEN": "模拟盘 access_token",
+    "LONGPORT_REAL_APP_KEY": "实盘 app_key",
+    "LONGPORT_REAL_APP_SECRET": "实盘 app_secret",
+    "LONGPORT_REAL_ACCESS_TOKEN": "实盘 access_token",
+    "LONGPORT_DEFAULT_MODE": "paper"
+  }
+}
 ```
 
-## 配置
+#### 方式 2: 配置文件
 
-### 环境变量配置
+创建 `longport_config.json`:
+
+```json
+{
+    "paper": {
+        "app_key": "模拟盘 app_key",
+        "app_secret": "模拟盘 app_secret",
+        "access_token": "模拟盘 access_token"
+    },
+    "real": {
+        "app_key": "实盘 app_key",
+        "app_secret": "实盘 app_secret",
+        "access_token": "实盘 access_token"
+    },
+    "default_mode": "paper"
+}
+```
+
+#### 方式 3: 单账户模式（向后兼容）
 
 ```bash
 export LONGPORT_APP_KEY="your_app_key"
@@ -48,105 +70,35 @@ export LONGPORT_APP_SECRET="your_app_secret"
 export LONGPORT_ACCESS_TOKEN="your_access_token"
 ```
 
-### 配置文件配置
+## 模拟盘/实盘切换
 
-创建 `longport_config.json`:
+```
+# 查看当前模式
+get_account_mode()
 
-```json
-{
-    "app_key": "your_app_key",
-    "app_secret": "your_app_secret",
-    "access_token": "your_access_token"
-}
+# 切换到实盘（会显示警告）
+switch_account_mode("real")
+
+# 切换回模拟盘
+switch_account_mode("paper")
 ```
 
-## Agent 接入配置
-
-### Claude Desktop
-
-将以下内容添加到 Claude Desktop 配置文件:
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-```json
-{
-  "mcpServers": {
-    "longport-trading": {
-      "command": "uvx",
-      "args": ["longport-mcp"],
-      "env": {
-        "LONGPORT_APP_KEY": "your_app_key",
-        "LONGPORT_APP_SECRET": "your_app_secret",
-        "LONGPORT_ACCESS_TOKEN": "your_access_token"
-      }
-    }
-  }
-}
-```
-
-### 通用 MCP 配置 (mcp.json)
-
-```json
-{
-  "mcpServers": {
-    "longport-mcp": {
-      "command": "uvx",
-      "args": ["longport-mcp"],
-      "env": {
-        "LONGPORT_APP_KEY": "${LONGPORT_APP_KEY}",
-        "LONGPORT_APP_SECRET": "${LONGPORT_APP_SECRET}",
-        "LONGPORT_ACCESS_TOKEN": "${LONGPORT_ACCESS_TOKEN}"
-      }
-    }
-  }
-}
-```
-
-### 使用 Python 直接运行
-
-```json
-{
-  "mcpServers": {
-    "longport-mcp": {
-      "command": "python",
-      "args": ["-m", "longport_mcp_web"],
-      "cwd": "/path/to/longport_mcp",
-      "env": {
-        "LONGPORT_APP_KEY": "your_app_key",
-        "LONGPORT_APP_SECRET": "your_app_secret",
-        "LONGPORT_ACCESS_TOKEN": "your_access_token"
-      }
-    }
-  }
-}
-```
-
-### 使用 uv run
-
-```json
-{
-  "mcpServers": {
-    "longport-mcp": {
-      "command": "uv",
-      "args": ["run", "longport-mcp"],
-      "env": {
-        "LONGPORT_APP_KEY": "your_app_key",
-        "LONGPORT_APP_SECRET": "your_app_secret",
-        "LONGPORT_ACCESS_TOKEN": "your_access_token"
-      }
-    }
-  }
-}
-```
+下单时会显示当前模式：`[模拟盘] [OK] 订单已提交` 或 `[实盘] [OK] 订单已提交`
 
 ## 可用工具列表
 
-### 交易工具 (Trading)
+### 账户管理
+| 工具名 | 功能 |
+|--------|------|
+| `get_account_mode` | 查看当前账户模式（模拟盘/实盘） |
+| `switch_account_mode` | 切换账户模式 |
+| `check_sdk_status` | 检查 SDK 和模块状态 |
 
+### 交易工具
 | 工具名 | 功能 |
 |--------|------|
 | `place_order` | 立即下单（市价/限价） |
-| `submit_order_advanced` | 高级下单（支持条件单、盘前盘后等） |
+| `submit_order_advanced` | 高级下单（条件单、盘前盘后） |
 | `modify_order` | 修改订单 |
 | `cancel_order` | 撤销单个订单 |
 | `cancel_all_orders` | 撤销所有订单 |
@@ -156,15 +108,13 @@ export LONGPORT_ACCESS_TOKEN="your_access_token"
 | `get_order_detail` | 获取订单详情 |
 | `estimate_buy_limit` | 估算最大可买数量 |
 
-### 成交记录 (Executions)
-
+### 成交记录
 | 工具名 | 功能 |
 |--------|------|
 | `get_today_executions` | 今日成交记录 |
 | `get_history_executions` | 历史成交记录 |
 
-### 资产工具 (Assets)
-
+### 资产工具
 | 工具名 | 功能 |
 |--------|------|
 | `get_assets` | 账户资产余额 |
@@ -173,28 +123,34 @@ export LONGPORT_ACCESS_TOKEN="your_access_token"
 | `get_cash_flow` | 资金流水 |
 | `get_margin_ratio` | 保证金比率 |
 
-### 行情工具 (Quotes)
+### 行情工具
+| 工具名 | 功能 | 数据源 |
+|--------|------|--------|
+| `get_quote` | 实时行情（股票/加密货币） | REST API / yfinance |
+| `get_candlesticks` | K线数据 | SDK / yfinance |
+| `get_depth` | 盘口深度 | SDK |
+| `get_brokers` | 经纪商队列（港股） | SDK |
+| `get_trades` | 成交明细 | SDK |
+| `get_intraday` | 分时数据 | SDK |
+| `get_static_info` | 标的基本信息 | REST API |
+| `get_symbol_fundamentals` | 基本面信息 | REST API |
+| `search_symbol` | 搜索股票代码 | yfinance |
+| `get_exchange_rate` | 汇率查询 | yfinance |
 
+### SDK 专属功能
 | 工具名 | 功能 |
 |--------|------|
-| `get_quote` | 实时行情 |
-| `get_candlesticks` | K线数据 |
-| `get_depth` | 盘口深度 |
-| `get_brokers` | 经纪商队列（港股） |
-| `get_trades` | 成交明细 |
-| `get_intraday` | 分时数据 |
-| `get_static_info` | 标的基本信息 |
-| `get_symbol_fundamentals` | 基本面信息 |
+| `get_trading_days` | 交易日历 |
+| `get_capital_flow` | 个股资金流向 |
+| `get_capital_distribution` | 资金分布 |
 
-### 期权/窝轮 (Options/Warrants)
-
+### 期权/窝轮
 | 工具名 | 功能 |
 |--------|------|
 | `get_option_expiry_dates` | 期权到期日列表 |
 | `get_warrant_issuers` | 窝轮发行商列表 |
 
-### 定时任务 (Scheduled Tasks)
-
+### 定时任务
 | 工具名 | 功能 |
 |--------|------|
 | `schedule_trade` | 定时下单 |
@@ -202,37 +158,27 @@ export LONGPORT_ACCESS_TOKEN="your_access_token"
 | `list_schedules` | 查看定时任务 |
 | `cancel_schedule` | 取消定时任务 |
 
-### 通用工具 (Utilities)
-
+### 通用工具
 | 工具名 | 功能 |
 |--------|------|
 | `call_longport_api` | 通用 API 调用 |
-| `search_symbol` | 搜索股票代码 |
-| `get_exchange_rate` | 汇率查询 |
+| `get_current_time` | 获取当前时间 |
 
-## API 端点参考
+## 行情代码格式
 
-| 功能 | HTTP 方法 | 端点 |
-|------|----------|------|
-| 账户余额 | GET | `/v1/asset/account` |
-| 股票持仓 | GET | `/v1/asset/stock` |
-| 基金持仓 | GET | `/v1/asset/fund` |
-| 资金流水 | GET | `/v1/asset/cashflow` |
-| 下单 | POST | `/v1/trade/order` |
-| 改单 | PUT | `/v1/trade/order` |
-| 撤单 | DELETE | `/v1/trade/order` |
-| 订单详情 | GET | `/v1/trade/order` |
-| 今日订单 | GET | `/v1/trade/order/today` |
-| 历史订单 | GET | `/v1/trade/order/history` |
-| 今日成交 | GET | `/v1/trade/execution/today` |
-| 历史成交 | GET | `/v1/trade/execution/history` |
+```
+美股: AAPL.US, TSLA.US, NVDA.US
+港股: 700.HK, 9988.HK
+A股: 600519.SH, 000001.SZ
+加密货币: BTC-USD, ETH-USD, DOGE-USD (注意用横杠)
+```
 
 ## 获取 API 凭证
 
 1. 注册 [长桥证券](https://longportapp.com) 账户
 2. 进入 [开发者后台](https://open.longportapp.com)
 3. 创建应用获取 `app_key` 和 `app_secret`
-4. 生成 `access_token`
+4. 生成 `access_token`（模拟盘和实盘分别生成）
 
 ## 许可证
 
