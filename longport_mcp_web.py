@@ -2258,5 +2258,10 @@ def get_today_all_orders() -> str:
 
 
 # ================= 主入口 =================
-if __name__ == "__main__":
+def main():
+    """Main entry point for the MCP server."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
