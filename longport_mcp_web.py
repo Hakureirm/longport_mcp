@@ -1908,49 +1908,68 @@ def get_margin_ratio(symbol: str) -> str:
 
 
 # ------------------------------------------
-# 工具 23: 获取K线数据
+# 工具 23: 获取K线数据（使用 yfinance）
 # ------------------------------------------
 @mcp.tool()
 def get_candlesticks(
     symbol: str,
     period: str = "1d",
-    count: int = 100
+    count: int = 30
 ) -> str:
     """
-    获取K线数据。
+    获取K线数据。使用 Yahoo Finance 数据源。
 
     Args:
-        symbol: 股票代码
-        period: K线周期 (1m/5m/15m/30m/60m/1d/1w/1M/1y)
-        count: K线数量（最大1000）
+        symbol: 股票代码（如 AAPL.US, 700.HK, ORCL.US）
+        period: K线周期 (1d=日线, 1wk=周线, 1mo=月线)
+        count: K线数量（默认30根）
 
     Returns:
-        K线数据
+        K线数据（开高低收+成交量）
     """
+    if not HAS_YFINANCE:
+        return "[X] yfinance 未安装，无法获取K线。安装: pip install yfinance"
+
     try:
-        client = get_client()
+        # 转换为 Yahoo Finance 格式
         target = to_sdk_symbol(symbol)
-        resp = client.get_candlesticks(target, period, count)
+        yahoo_symbol = to_yahoo_symbol(target)
 
-        candles = resp.get("data", {}).get("candlesticks", [])
+        # 周期映射
+        interval_map = {
+            "1d": "1d", "day": "1d", "daily": "1d",
+            "1w": "1wk", "1wk": "1wk", "week": "1wk", "weekly": "1wk",
+            "1m": "1mo", "1mo": "1mo", "month": "1mo", "monthly": "1mo",
+        }
+        interval = interval_map.get(period.lower(), "1d")
 
-        if not candles:
-            return "[i] 无K线数据"
+        # 根据周期决定获取多长时间的数据
+        if interval == "1d":
+            period_str = f"{min(count, 60)}d"  # 最多60天日线
+        elif interval == "1wk":
+            period_str = f"{min(count * 7, 365)}d"  # 周线
+        else:
+            period_str = f"{min(count * 30, 730)}d"  # 月线
 
-        results = [f"**{target} {period} K线 (最近{len(candles)}根)**"]
+        ticker = yf.Ticker(yahoo_symbol)
+        df = ticker.history(period=period_str, interval=interval)
 
-        # 显示最近5根K线
-        for c in candles[-5:]:
-            o = c.get("open", "")
-            h = c.get("high", "")
-            l = c.get("low", "")
-            close = c.get("close", "")
-            vol = c.get("volume", "")
-            ts = c.get("timestamp", "")
-            results.append(f"  {ts}: O:{o} H:{h} L:{l} C:{close} V:{vol}")
+        if df.empty:
+            return f"[X] 无K线数据: {symbol}"
 
-        if len(candles) > 5:
-            results.append(f"  ... 共 {len(candles)} 根K线")
+        # 只取最近 count 根
+        df = df.tail(count)
+
+        results = [f"**{target} {period} K线 (最近{len(df)}根)**"]
+
+        for idx, row in df.iterrows():
+            date_str = idx.strftime("%Y-%m-%d")
+            o = f"{row['Open']:.2f}"
+            h = f"{row['High']:.2f}"
+            l = f"{row['Low']:.2f}"
+            c = f"{row['Close']:.2f}"
+            v = f"{int(row['Volume']):,}"
+            results.append(f"  {date_str}: O:{o} H:{h} L:{l} C:{c} V:{v}")
 
         return "\n".join(results)
 
