@@ -1213,24 +1213,33 @@ def get_positions() -> str:
         client = get_client()
         resp = client.get_stock_positions()
 
-        positions = resp.get("data", {}).get("list", [])
+        # API 返回结构: data.list[0].stock_info 包含持仓列表
+        data_list = resp.get("data", {}).get("list", [])
 
-        if not positions:
+        if not data_list:
             return "[i] 无持仓"
 
         results = ["**持仓列表**"]
-        for p in positions:
-            quantity = int(p.get("quantity", 0))
-            if quantity == 0:
-                continue
 
-            symbol = p.get("symbol", "")
-            cost_price = p.get("cost_price", "N/A")
-            available = p.get("available_quantity", quantity)
+        for account in data_list:
+            stock_info = account.get("stock_info", [])
+            account_channel = account.get("account_channel", "")
 
-            results.append(
-                f"  {symbol}: {quantity}股 (可用: {available}, 成本: {cost_price})"
-            )
+            for p in stock_info:
+                quantity = int(p.get("quantity", 0))
+                if quantity == 0:
+                    continue
+
+                symbol = p.get("symbol", "")
+                symbol_name = p.get("symbol_name", "")
+                cost_price = p.get("cost_price", "N/A")
+                available = p.get("available_quantity", quantity)
+                market = p.get("market", "")
+                currency = p.get("currency", "")
+
+                results.append(
+                    f"  {symbol} ({symbol_name}): {quantity}股 (可用: {available}, 成本: {cost_price} {currency})"
+                )
 
         return "\n".join(results) if len(results) > 1 else "[i] 无持仓"
 
@@ -1256,16 +1265,23 @@ def get_assets(currency: str = "") -> str:
         client = get_client()
         resp = client.get_account_balance(currency if currency else None)
 
-        data = resp.get("data", {})
+        # API 返回结构: data.list[0] 包含账户信息
+        data_list = resp.get("data", {}).get("list", [])
+        if not data_list:
+            return "[X] 无账户数据"
+
+        data = data_list[0]
 
         results = ["**账户资产**"]
 
         # 总资产信息
         total_cash = data.get("total_cash", "N/A")
         net_assets = data.get("net_assets", "N/A")
+        buy_power = data.get("buy_power", "N/A")
 
         results.append(f"  总现金: {total_cash}")
         results.append(f"  净资产: {net_assets}")
+        results.append(f"  购买力: {buy_power}")
 
         # 各币种现金
         cash_info = data.get("cash_infos", [])
@@ -1274,7 +1290,9 @@ def get_assets(currency: str = "") -> str:
             for c in cash_info:
                 curr = c.get("currency", "")
                 available = c.get("available_cash", c.get("cash", "N/A"))
-                results.append(f"    {curr}: {available}")
+                withdraw = c.get("withdraw_cash", "N/A")
+                frozen = c.get("frozen_cash", "0")
+                results.append(f"    {curr}: 可用 {available}, 可取 {withdraw}, 冻结 {frozen}")
 
         return "\n".join(results)
 
