@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Longport MCP Server - Web API Version
+Longport MCP Server - Hybrid Version
 =====================================
-基于 REST API 重写的长桥证券 MCP 服务，完全不依赖 longport SDK。
-使用 HMAC-SHA256 签名机制进行 API 鉴权。
+长桥证券 MCP 服务，支持 REST API + SDK 混合模式。
+- REST API: 交易、资产、持仓、订单
+- SDK (可选): 交易日历、资金流向、实时推送等高级功能
 
-配置文件: longport_config.json
-{
-    "app_key": "your_app_key",
-    "app_secret": "your_app_secret",
-    "access_token": "your_access_token"
-}
+配置方式：
+1. 环境变量（推荐）: LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
+2. 配置文件: longport_config.json
 """
 
 import sys
@@ -35,6 +33,13 @@ try:
     HAS_YFINANCE = True
 except ImportError:
     HAS_YFINANCE = False
+
+# 尝试导入 longport SDK（用于高级功能）
+try:
+    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period
+    HAS_SDK = True
+except ImportError:
+    HAS_SDK = False
 
 # ================= 配置区域 =================
 logging.basicConfig(
@@ -231,17 +236,24 @@ class LongportClient:
         Returns:
             API 响应数据
         """
-        url = f"{BASE_URL}{endpoint}"
         params_str = ""
 
         if params:
             # 构建查询字符串（按字母顺序排序）
-            sorted_params = sorted(params.items())
-            params_str = "&".join(f"{k}={v}" for k, v in sorted_params if v is not None)
+            # 过滤掉 None 值的参数
+            filtered_params = {k: v for k, v in params.items() if v is not None}
+            sorted_params = sorted(filtered_params.items())
+            params_str = "&".join(f"{k}={v}" for k, v in sorted_params)
 
         headers = self._build_headers("GET", endpoint, params_str)
 
-        response = self.session.get(url, params=params, headers=headers, timeout=30)
+        # 直接拼接 URL，避免 requests 库的额外编码导致签名不匹配
+        if params_str:
+            url = f"{BASE_URL}{endpoint}?{params_str}"
+        else:
+            url = f"{BASE_URL}{endpoint}"
+
+        response = self.session.get(url, headers=headers, timeout=30)
         return self._handle_response(response)
 
     def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -275,16 +287,22 @@ class LongportClient:
 
     def delete(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """发送 DELETE 请求"""
-        url = f"{BASE_URL}{endpoint}"
         params_str = ""
 
         if params:
-            sorted_params = sorted(params.items())
-            params_str = "&".join(f"{k}={v}" for k, v in sorted_params if v is not None)
+            filtered_params = {k: v for k, v in params.items() if v is not None}
+            sorted_params = sorted(filtered_params.items())
+            params_str = "&".join(f"{k}={v}" for k, v in sorted_params)
 
         headers = self._build_headers("DELETE", endpoint, params_str)
 
-        response = self.session.delete(url, params=params, headers=headers, timeout=30)
+        # 直接拼接 URL，避免 requests 库的额外编码导致签名不匹配
+        if params_str:
+            url = f"{BASE_URL}{endpoint}?{params_str}"
+        else:
+            url = f"{BASE_URL}{endpoint}"
+
+        response = self.session.delete(url, headers=headers, timeout=30)
         return self._handle_response(response)
 
     # ============== 业务接口封装 ==============
@@ -684,15 +702,31 @@ class LongportClient:
         return self.get("/v1/trade/estimate/buy_limit", params)
 
 
+
 # ================= 全局客户端实例 =================
 _client: Optional[LongportClient] = None
+_quote_ctx = None  # SDK QuoteContext
 
 def get_client() -> LongportClient:
-    """获取全局客户端实例（懒加载）"""
+    """获取全局 REST API 客户端实例（懒加载）"""
     global _client
     if _client is None:
         _client = LongportClient()
     return _client
+
+def get_quote_context():
+    """获取 SDK QuoteContext 实例（懒加载）"""
+    global _quote_ctx
+    if not HAS_SDK:
+        return None
+    if _quote_ctx is None:
+        try:
+            config = Config.from_env()
+            _quote_ctx = QuoteContext(config)
+        except Exception as e:
+            logger.error(f"SDK QuoteContext 初始化失败: {e}")
+            return None
+    return _quote_ctx
 # =================================================
 
 
@@ -1049,20 +1083,40 @@ def place_order(
 @mcp.tool()
 def get_exchange_rate(from_currency: str = "USD", to_currency: str = "CNY") -> str:
     """
-    获取汇率。
+    获取实时汇率。使用 Yahoo Finance 数据源。
+
+    常用货币代码：
+    - USD: 美元
+    - CNY: 人民币
+    - HKD: 港币
+    - JPY: 日元
+    - EUR: 欧元
+    - GBP: 英镑
+    - SGD: 新加坡元
+    - AUD: 澳元
+    - CAD: 加元
+
+    用法示例：
+    - 美元换人民币: from_currency="USD", to_currency="CNY"
+    - 日元换港币: from_currency="JPY", to_currency="HKD"
+    - 欧元换美元: from_currency="EUR", to_currency="USD"
 
     Args:
-        from_currency: 源货币（默认 USD）
-        to_currency: 目标货币（默认 CNY）
+        from_currency: 源货币代码（3位大写，如 USD, CNY, HKD）
+        to_currency: 目标货币代码（3位大写，如 USD, CNY, HKD）
 
     Returns:
-        汇率信息
+        汇率信息，包含正向和反向汇率
     """
     if not HAS_YFINANCE:
-        return "[X] yfinance 未安装，无法获取汇率"
+        return "[X] yfinance 未安装，无法获取汇率。安装: pip install yfinance"
 
     try:
-        symbol = f"{from_currency.upper()}{to_currency.upper()}=X"
+        from_curr = from_currency.upper().strip()
+        to_curr = to_currency.upper().strip()
+
+        # 获取汇率
+        symbol = f"{from_curr}{to_curr}=X"
         ticker = yf.Ticker(symbol)
 
         if hasattr(ticker, 'fast_info'):
@@ -1071,35 +1125,95 @@ def get_exchange_rate(from_currency: str = "USD", to_currency: str = "CNY") -> s
             price = ticker.info.get('regularMarketPrice')
 
         if not price:
-            return f"[X] 无汇率数据"
+            return f"[X] 无法获取 {from_curr}/{to_curr} 汇率"
 
-        return f"[i] 1 {from_currency.upper()} = {price:.4f} {to_currency.upper()}"
+        # 计算反向汇率
+        reverse_rate = 1 / price if price > 0 else 0
 
-    except Exception:
-        return "[X] 汇率接口异常"
+        return (
+            f"**{from_curr}/{to_curr} 汇率**\n"
+            f"  1 {from_curr} = {price:.4f} {to_curr}\n"
+            f"  1 {to_curr} = {reverse_rate:.4f} {from_curr}"
+        )
+
+    except Exception as e:
+        return f"[X] 汇率查询错误: {e}"
 
 
 # ------------------------------------------
 # 工具 7: 搜索股票代码（使用 Yahoo Finance）
 # ------------------------------------------
+# 常用股票别名映射
+STOCK_ALIAS = {
+    # 中文名 -> 英文关键词
+    "苹果": "Apple", "苹果公司": "Apple",
+    "特斯拉": "Tesla", "马斯克": "Tesla",
+    "谷歌": "Google", "谷歌公司": "Google", "alphabet": "Google",
+    "微软": "Microsoft", "亚马逊": "Amazon",
+    "脸书": "Meta", "facebook": "Meta", "元宇宙": "Meta",
+    "英伟达": "NVIDIA", "英伟达公司": "NVIDIA", "老黄": "NVIDIA",
+    "阿里": "Alibaba", "阿里巴巴": "Alibaba",
+    "腾讯": "Tencent", "腾讯控股": "Tencent",
+    "百度": "Baidu", "京东": "JD",
+    "拼多多": "Pinduoduo", "pdd": "Pinduoduo",
+    "网易": "NetEase", "bilibili": "Bilibili", "b站": "Bilibili",
+    "小米": "Xiaomi", "美团": "Meituan",
+    "字节跳动": "ByteDance", "抖音": "ByteDance",
+    "蔚来": "NIO", "理想": "Li Auto", "小鹏": "XPeng",
+    "台积电": "TSMC", "三星": "Samsung",
+    "索尼": "Sony", "任天堂": "Nintendo",
+    "可口可乐": "Coca-Cola", "百事": "Pepsi",
+    "麦当劳": "McDonald", "星巴克": "Starbucks",
+    "奈飞": "Netflix", "迪士尼": "Disney",
+    "波音": "Boeing", "空客": "Airbus",
+    "辉瑞": "Pfizer", "强生": "Johnson",
+}
+
 @mcp.tool()
-def search_symbol(keyword: str) -> str:
+def search_symbol(query: str) -> str:
     """
-    搜索股票代码。
+    搜索股票代码。使用 Yahoo Finance 数据源。
+
+    用法：传入公司英文名称或股票代码，返回长桥格式代码。
+
+    常用股票示例：
+    - 苹果公司: query="Apple" -> AAPL.US
+    - 特斯拉: query="Tesla" -> TSLA.US
+    - 腾讯控股: query="Tencent" -> 700.HK
+    - 阿里巴巴: query="Alibaba" -> 9988.HK / BABA.US
+    - 英伟达: query="NVIDIA" -> NVDA.US
 
     Args:
-        keyword: 搜索关键词（公司名或代码）
+        query: 公司名称（英文优先）或股票代码。
+               中文公司名会自动转换为英文关键词。
+               如：特斯拉->Tesla, 腾讯->Tencent, 苹果->Apple
 
     Returns:
-        搜索结果列表
+        搜索结果列表，包含长桥格式代码（如 AAPL.US, 700.HK）
     """
     try:
+        # 清理查询字符串
+        query = query.strip()
+
+        # 移除常见的提问前缀
+        prefixes = ["帮我查", "查一下", "搜索", "查询", "找一下", "股票代码", "代码是什么", "的代码"]
+        for prefix in prefixes:
+            query = query.replace(prefix, "")
+        query = query.strip()
+
+        # 检查别名映射
+        query_lower = query.lower()
+        for alias, keyword in STOCK_ALIAS.items():
+            if alias in query_lower or query_lower in alias:
+                query = keyword
+                break
+
         url = "https://query2.finance.yahoo.com/v1/finance/search"
         params = {
-            "q": keyword,
+            "q": query,
             "lang": "zh-CN",
             "region": "HK",
-            "quotesCount": 5
+            "quotesCount": 8
         }
         resp = requests.get(
             url,
@@ -1110,18 +1224,39 @@ def search_symbol(keyword: str) -> str:
         data = resp.json()
 
         if "quotes" not in data or not data["quotes"]:
-            return f"[X] 未找到: {keyword}"
+            return f"[X] 未找到: {query}"
 
-        results = []
+        results = [f"**搜索: {query}**"]
         for item in data["quotes"]:
-            sym = to_sdk_symbol(item.get("symbol", ""))
-            name = item.get("shortname") or item.get("longname", keyword)
-            results.append(f"  {name} -> {sym}")
+            yahoo_sym = item.get("symbol", "")
+            longport_sym = to_sdk_symbol(yahoo_sym)
+            name = item.get("shortname") or item.get("longname", "")
+            exchange = item.get("exchange", "")
+            quote_type = item.get("quoteType", "")
 
-        return "[i] 搜索结果:\n" + "\n".join(results)
+            # 过滤掉非股票类型（如指数、基金等）
+            if quote_type not in ["EQUITY", "ETF"]:
+                continue
 
-    except Exception:
-        return "[X] 搜索异常"
+            # 格式化市场信息
+            market = ""
+            if ".HK" in longport_sym:
+                market = "港股"
+            elif ".US" in longport_sym:
+                market = "美股"
+            elif ".SH" in longport_sym or ".SZ" in longport_sym:
+                market = "A股"
+
+            results.append(f"  [{longport_sym}] {name} ({market})")
+
+        if len(results) == 1:
+            return f"[X] 未找到: {query}"
+
+        results.append(f"\n提示: 使用长桥代码（如 {results[1].split(']')[0][3:]}）进行交易")
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 搜索异常: {e}"
 
 
 # ------------------------------------------
@@ -1213,24 +1348,33 @@ def get_positions() -> str:
         client = get_client()
         resp = client.get_stock_positions()
 
-        positions = resp.get("data", {}).get("list", [])
+        # API 返回结构: data.list[0].stock_info 包含持仓列表
+        data_list = resp.get("data", {}).get("list", [])
 
-        if not positions:
+        if not data_list:
             return "[i] 无持仓"
 
         results = ["**持仓列表**"]
-        for p in positions:
-            quantity = int(p.get("quantity", 0))
-            if quantity == 0:
-                continue
 
-            symbol = p.get("symbol", "")
-            cost_price = p.get("cost_price", "N/A")
-            available = p.get("available_quantity", quantity)
+        for account in data_list:
+            stock_info = account.get("stock_info", [])
+            account_channel = account.get("account_channel", "")
 
-            results.append(
-                f"  {symbol}: {quantity}股 (可用: {available}, 成本: {cost_price})"
-            )
+            for p in stock_info:
+                quantity = int(p.get("quantity", 0))
+                if quantity == 0:
+                    continue
+
+                symbol = p.get("symbol", "")
+                symbol_name = p.get("symbol_name", "")
+                cost_price = p.get("cost_price", "N/A")
+                available = p.get("available_quantity", quantity)
+                market = p.get("market", "")
+                currency = p.get("currency", "")
+
+                results.append(
+                    f"  {symbol} ({symbol_name}): {quantity}股 (可用: {available}, 成本: {cost_price} {currency})"
+                )
 
         return "\n".join(results) if len(results) > 1 else "[i] 无持仓"
 
@@ -1256,16 +1400,23 @@ def get_assets(currency: str = "") -> str:
         client = get_client()
         resp = client.get_account_balance(currency if currency else None)
 
-        data = resp.get("data", {})
+        # API 返回结构: data.list[0] 包含账户信息
+        data_list = resp.get("data", {}).get("list", [])
+        if not data_list:
+            return "[X] 无账户数据"
+
+        data = data_list[0]
 
         results = ["**账户资产**"]
 
         # 总资产信息
         total_cash = data.get("total_cash", "N/A")
         net_assets = data.get("net_assets", "N/A")
+        buy_power = data.get("buy_power", "N/A")
 
         results.append(f"  总现金: {total_cash}")
         results.append(f"  净资产: {net_assets}")
+        results.append(f"  购买力: {buy_power}")
 
         # 各币种现金
         cash_info = data.get("cash_infos", [])
@@ -1274,7 +1425,9 @@ def get_assets(currency: str = "") -> str:
             for c in cash_info:
                 curr = c.get("currency", "")
                 available = c.get("available_cash", c.get("cash", "N/A"))
-                results.append(f"    {curr}: {available}")
+                withdraw = c.get("withdraw_cash", "N/A")
+                frozen = c.get("frozen_cash", "0")
+                results.append(f"    {curr}: 可用 {available}, 可取 {withdraw}, 冻结 {frozen}")
 
         return "\n".join(results)
 
@@ -2255,6 +2408,247 @@ def get_today_all_orders() -> str:
 
     except Exception as e:
         return f"[X] 今日订单查询失败: {e}"
+
+
+# ------------------------------------------
+# 工具 35: 获取当前时间
+# ------------------------------------------
+@mcp.tool()
+def get_current_time() -> str:
+    """
+    获取当前时间（用于调试和时间计算）。
+
+    Returns:
+        当前时间信息
+    """
+    from datetime import datetime
+    import time
+
+    now = datetime.now()
+    utc_now = datetime.utcnow()
+
+    return (
+        f"**当前时间**\n"
+        f"  本地: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"  UTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"  时间戳: {int(time.time())}"
+    )
+
+
+# ==================== SDK 增强功能 ====================
+# 以下工具需要 longport SDK 支持，提供更丰富的行情数据
+
+# ------------------------------------------
+# 工具 36: 获取交易日历 (SDK)
+# ------------------------------------------
+@mcp.tool()
+def get_trading_days(
+    market: str = "US",
+    start_date: str = "",
+    end_date: str = ""
+) -> str:
+    """
+    获取交易日历（需要 SDK 支持）。
+
+    Args:
+        market: 市场代码（US/HK/CN/SG），默认 US
+        start_date: 开始日期 YYYY-MM-DD，默认为今天
+        end_date: 结束日期 YYYY-MM-DD，默认为30天后
+
+    Returns:
+        交易日列表
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+
+    try:
+        from datetime import date
+
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败，请检查环境变量配置"
+
+        # 默认日期
+        today = date.today()
+        if not start_date:
+            begin = today
+        else:
+            begin = date.fromisoformat(start_date)
+
+        if not end_date:
+            end = date(today.year, today.month + 1 if today.month < 12 else 1,
+                      today.day if today.month < 12 else today.day)
+            if today.month == 12:
+                end = date(today.year + 1, 1, today.day)
+        else:
+            end = date.fromisoformat(end_date)
+
+        # 市场映射
+        market_map = {
+            "US": Market.US,
+            "HK": Market.HK,
+            "CN": Market.CN,
+            "SG": Market.SG,
+        }
+        mkt = market_map.get(market.upper(), Market.US)
+
+        resp = ctx.trading_days(mkt, begin, end)
+
+        results = [f"**{market} 交易日历 ({begin} ~ {end})**"]
+
+        trading_days = resp.trading_days if hasattr(resp, 'trading_days') else []
+        half_trading_days = resp.half_trading_days if hasattr(resp, 'half_trading_days') else []
+
+        if trading_days:
+            results.append(f"  交易日数: {len(trading_days)}")
+            # 显示最近10个
+            days_str = [d.strftime("%Y-%m-%d") for d in trading_days[:10]]
+            results.append(f"  日期: {', '.join(days_str)}")
+            if len(trading_days) > 10:
+                results.append(f"  ... 共 {len(trading_days)} 个交易日")
+
+        if half_trading_days:
+            half_str = [d.strftime("%Y-%m-%d") for d in half_trading_days]
+            results.append(f"  半日交易: {', '.join(half_str)}")
+
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 交易日历查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具 37: 获取资金流向 (SDK)
+# ------------------------------------------
+@mcp.tool()
+def get_capital_flow(symbol: str) -> str:
+    """
+    获取个股当日资金流向（需要 SDK 支持）。
+
+    Args:
+        symbol: 股票代码
+
+    Returns:
+        资金流向信息
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败，请检查环境变量配置"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.capital_flow(target)
+
+        if not resp:
+            return f"[i] {target} 无资金流向数据"
+
+        results = [f"**{target} 资金流向**"]
+
+        # 显示最近5条
+        for line in resp[-5:]:
+            inflow = getattr(line, 'inflow', 0)
+            ts = getattr(line, 'timestamp', '')
+            results.append(f"  {ts}: 净流入 {inflow}")
+
+        if len(resp) > 5:
+            results.append(f"  ... 共 {len(resp)} 条记录")
+
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 资金流向查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具 38: 获取资金分布 (SDK)
+# ------------------------------------------
+@mcp.tool()
+def get_capital_distribution(symbol: str) -> str:
+    """
+    获取个股资金分布（需要 SDK 支持）。
+
+    Args:
+        symbol: 股票代码
+
+    Returns:
+        资金分布信息（大单/中单/小单）
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败，请检查环境变量配置"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.capital_distribution(target)
+
+        results = [f"**{target} 资金分布**"]
+
+        # 大单
+        large_in = getattr(resp, 'capital_in_large', 0)
+        large_out = getattr(resp, 'capital_out_large', 0)
+        results.append(f"  大单: 流入 {large_in}, 流出 {large_out}")
+
+        # 中单
+        medium_in = getattr(resp, 'capital_in_medium', 0)
+        medium_out = getattr(resp, 'capital_out_medium', 0)
+        results.append(f"  中单: 流入 {medium_in}, 流出 {medium_out}")
+
+        # 小单
+        small_in = getattr(resp, 'capital_in_small', 0)
+        small_out = getattr(resp, 'capital_out_small', 0)
+        results.append(f"  小单: 流入 {small_in}, 流出 {small_out}")
+
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 资金分布查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具 39: 检查 SDK 状态
+# ------------------------------------------
+@mcp.tool()
+def check_sdk_status() -> str:
+    """
+    检查 SDK 和各模块的可用状态。
+
+    Returns:
+        各模块状态信息
+    """
+    results = ["**模块状态检查**"]
+
+    # SDK 状态
+    if HAS_SDK:
+        results.append("  [OK] longport SDK 已安装")
+        ctx = get_quote_context()
+        if ctx:
+            results.append("  [OK] SDK QuoteContext 已初始化")
+        else:
+            results.append("  [X] SDK QuoteContext 初始化失败")
+    else:
+        results.append("  [X] longport SDK 未安装")
+        results.append("      安装命令: pip install longport")
+
+    # yfinance 状态
+    if HAS_YFINANCE:
+        results.append("  [OK] yfinance 已安装 (备用行情源)")
+    else:
+        results.append("  [i] yfinance 未安装 (可选)")
+
+    # REST API 状态
+    try:
+        client = get_client()
+        results.append("  [OK] REST API 客户端已初始化")
+    except Exception as e:
+        results.append(f"  [X] REST API 初始化失败: {e}")
+
+    return "\n".join(results)
 
 
 # ================= 主入口 =================

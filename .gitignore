@@ -7,8 +7,11 @@ __pycache__/
 *.egg
 *.egg-info/
 .eggs/
-dist/
 build/
+
+# Keep dist for publishing reference but ignore contents
+dist/*
+!dist/.gitignore
 
 # Virtual environments
 venv/
