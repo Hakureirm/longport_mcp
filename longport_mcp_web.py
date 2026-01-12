@@ -834,12 +834,14 @@ def get_quote_context():
         if _paper_quote_ctx is None:
             try:
                 client = get_client()
+                logger.info(f"SDK初始化 (paper): app_key={client.app_key[:8] if client.app_key else 'None'}...")
                 config = Config(
                     app_key=client.app_key,
                     app_secret=client.app_secret,
                     access_token=client.access_token
                 )
                 _paper_quote_ctx = QuoteContext(config)
+                logger.info("SDK QuoteContext (paper) 初始化成功")
             except Exception as e:
                 logger.error(f"SDK QuoteContext (paper) 初始化失败: {e}")
                 return None
@@ -848,12 +850,14 @@ def get_quote_context():
         if _real_quote_ctx is None:
             try:
                 client = get_client()
+                logger.info(f"SDK初始化 (real): app_key={client.app_key[:8] if client.app_key else 'None'}...")
                 config = Config(
                     app_key=client.app_key,
                     app_secret=client.app_secret,
                     access_token=client.access_token
                 )
                 _real_quote_ctx = QuoteContext(config)
+                logger.info("SDK QuoteContext (real) 初始化成功")
             except Exception as e:
                 logger.error(f"SDK QuoteContext (real) 初始化失败: {e}")
                 return None
