@@ -125,22 +125,39 @@ class LongportClient:
         Args:
             config_path: 配置文件路径，默认为当前目录下的 longport_config.json
             mode: 账户模式，"paper"=模拟盘，"real"=实盘
+
+        支持的环境变量（双账户模式）：
+            LONGPORT_PAPER_APP_KEY, LONGPORT_PAPER_APP_SECRET, LONGPORT_PAPER_ACCESS_TOKEN
+            LONGPORT_REAL_APP_KEY, LONGPORT_REAL_APP_SECRET, LONGPORT_REAL_ACCESS_TOKEN
+            LONGPORT_DEFAULT_MODE (可选，默认 "paper")
+
+        也支持旧的单账户环境变量：
+            LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
         """
         self.mode = mode
         self.config = self._load_config(config_path)
 
-        # 检查是否为新格式（双账户）
+        # 优先级: 1. 配置文件 2. 带模式前缀的环境变量 3. 旧环境变量
+
+        # 检查是否为新格式配置文件（双账户）
         if "paper" in self.config or "real" in self.config:
-            # 新格式：从对应模式获取凭证
             mode_config = self.config.get(mode, {})
             self.app_key = mode_config.get("app_key")
             self.app_secret = mode_config.get("app_secret")
             self.access_token = mode_config.get("access_token")
         else:
-            # 旧格式：向后兼容
-            self.app_key = self.config.get("app_key") or os.getenv("LONGPORT_APP_KEY")
-            self.app_secret = self.config.get("app_secret") or os.getenv("LONGPORT_APP_SECRET")
-            self.access_token = self.config.get("access_token") or os.getenv("LONGPORT_ACCESS_TOKEN")
+            self.app_key = self.config.get("app_key")
+            self.app_secret = self.config.get("app_secret")
+            self.access_token = self.config.get("access_token")
+
+        # 如果配置文件没有，尝试环境变量（带模式前缀）
+        mode_upper = mode.upper()
+        if not self.app_key:
+            self.app_key = os.getenv(f"LONGPORT_{mode_upper}_APP_KEY") or os.getenv("LONGPORT_APP_KEY")
+        if not self.app_secret:
+            self.app_secret = os.getenv(f"LONGPORT_{mode_upper}_APP_SECRET") or os.getenv("LONGPORT_APP_SECRET")
+        if not self.access_token:
+            self.access_token = os.getenv(f"LONGPORT_{mode_upper}_ACCESS_TOKEN") or os.getenv("LONGPORT_ACCESS_TOKEN")
 
         if not all([self.app_key, self.app_secret, self.access_token]):
             raise ValueError(f"缺少必要的配置 ({mode}): app_key, app_secret, access_token")
@@ -745,7 +762,13 @@ _quote_ctx = None  # SDK QuoteContext
 
 
 def _load_default_mode() -> str:
-    """从配置文件加载默认模式"""
+    """从环境变量或配置文件加载默认模式"""
+    # 优先使用环境变量
+    env_mode = os.getenv("LONGPORT_DEFAULT_MODE", "").lower()
+    if env_mode in ["paper", "real"]:
+        return env_mode
+
+    # 其次从配置文件加载
     paths_to_try = [
         CONFIG_FILE,
         os.path.join(os.path.dirname(__file__), CONFIG_FILE),
