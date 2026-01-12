@@ -2315,7 +2315,13 @@ def get_trades(symbol: str, count: int = 20) -> str:
         for t in trades[:10]:
             price = t.price if hasattr(t, 'price') else ""
             vol = t.volume if hasattr(t, 'volume') else ""
-            direction = t.direction.name if hasattr(t, 'direction') and t.direction else ""
+            # direction 可能是枚举类型，用 str() 安全转换
+            direction = ""
+            if hasattr(t, 'direction') and t.direction is not None:
+                try:
+                    direction = t.direction.name
+                except AttributeError:
+                    direction = str(t.direction)
             ts = t.timestamp if hasattr(t, 'timestamp') else ""
             results.append(f"  {ts}: {price} x {vol} ({direction})")
 

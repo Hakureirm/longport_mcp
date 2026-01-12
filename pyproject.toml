@@ -1,6 +1,6 @@
 [project]
 name = "longport-mcp"
-version = "0.2.6"
+version = "0.2.7"
 description = "Longport Trading MCP Server - REST API + SDK hybrid"
 readme = "README.md"
 requires-python = ">=3.10"
