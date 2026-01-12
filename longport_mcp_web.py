@@ -782,6 +782,40 @@ def to_sdk_symbol(symbol: str) -> str:
     return s
 
 
+def to_yahoo_symbol(symbol: str) -> str:
+    """
+    转换长桥格式代码为 Yahoo Finance 格式
+
+    Examples:
+        AAPL.US -> AAPL
+        700.HK -> 0700.HK
+        600519.SH -> 600519.SS
+        000001.SZ -> 000001.SZ
+    """
+    s = symbol.upper().strip()
+
+    # 美股：去掉 .US 后缀
+    if s.endswith(".US"):
+        return s.replace(".US", "")
+
+    # 港股：补齐4位数字
+    if s.endswith(".HK"):
+        parts = s.split(".")
+        code = parts[0].zfill(4)  # 补齐前导零
+        return f"{code}.HK"
+
+    # 上证：.SH -> .SS
+    if s.endswith(".SH"):
+        return s.replace(".SH", ".SS")
+
+    # 深证：保持不变
+    if s.endswith(".SZ"):
+        return s
+
+    # 其他情况原样返回
+    return s
+
+
 # ---------------------------------------------------------
 # 内部核心逻辑
 # ---------------------------------------------------------
