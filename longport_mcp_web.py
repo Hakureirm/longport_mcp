@@ -2313,16 +2313,11 @@ def get_trades(symbol: str, count: int = 20) -> str:
 
         results = [f"**{target} 最近成交**"]
         for t in trades[:10]:
-            price = t.price if hasattr(t, 'price') else ""
-            vol = t.volume if hasattr(t, 'volume') else ""
-            # direction 可能是枚举类型，用 str() 安全转换
-            direction = ""
-            if hasattr(t, 'direction') and t.direction is not None:
-                try:
-                    direction = t.direction.name
-                except AttributeError:
-                    direction = str(t.direction)
-            ts = t.timestamp if hasattr(t, 'timestamp') else ""
+            price = getattr(t, 'price', "")
+            vol = getattr(t, 'volume', "")
+            # direction 直接用 str() 转换，避免枚举类型问题
+            direction = str(getattr(t, 'direction', "")) if hasattr(t, 'direction') else ""
+            ts = getattr(t, 'timestamp', "")
             results.append(f"  {ts}: {price} x {vol} ({direction})")
 
         return "\n".join(results)
