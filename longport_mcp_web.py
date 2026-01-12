@@ -2200,7 +2200,7 @@ def get_candlesticks(
 @mcp.tool()
 def get_depth(symbol: str) -> str:
     """
-    获取盘口深度（买卖盘）。
+    获取盘口深度（买卖盘）。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -2208,28 +2208,28 @@ def get_depth(symbol: str) -> str:
     Returns:
         盘口深度信息
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_depth(target)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        data = resp.get("data", {})
-        asks = data.get("ask", [])
-        bids = data.get("bid", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.depth(target)
 
         results = [f"**{target} 盘口深度**"]
 
-        results.append("  卖盘:")
-        for a in asks[:5]:
-            price = a.get("price", "")
-            vol = a.get("volume", "")
-            results.append(f"    {price} x {vol}")
+        if hasattr(resp, 'asks') and resp.asks:
+            results.append("  卖盘:")
+            for a in resp.asks[:5]:
+                results.append(f"    {a.price} x {a.volume}")
 
-        results.append("  买盘:")
-        for b in bids[:5]:
-            price = b.get("price", "")
-            vol = b.get("volume", "")
-            results.append(f"    {price} x {vol}")
+        if hasattr(resp, 'bids') and resp.bids:
+            results.append("  买盘:")
+            for b in resp.bids[:5]:
+                results.append(f"    {b.price} x {b.volume}")
 
         return "\n".join(results)
 
@@ -2243,7 +2243,7 @@ def get_depth(symbol: str) -> str:
 @mcp.tool()
 def get_brokers(symbol: str) -> str:
     """
-    获取经纪商队列（港股专用）。
+    获取经纪商队列（港股专用）。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -2251,28 +2251,30 @@ def get_brokers(symbol: str) -> str:
     Returns:
         经纪商队列信息
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_brokers(target)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        data = resp.get("data", {})
-        ask_brokers = data.get("ask_brokers", [])
-        bid_brokers = data.get("bid_brokers", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        resp = ctx.brokers(target)
 
         results = [f"**{target} 经纪商队列**"]
 
-        results.append("  卖方经纪商:")
-        for b in ask_brokers[:5]:
-            price = b.get("price", "")
-            broker_ids = b.get("broker_ids", [])
-            results.append(f"    {price}: {broker_ids[:3]}...")
+        if hasattr(resp, 'ask_brokers') and resp.ask_brokers:
+            results.append("  卖方经纪商:")
+            for b in resp.ask_brokers[:5]:
+                broker_ids = b.broker_ids if hasattr(b, 'broker_ids') else []
+                results.append(f"    {broker_ids[:5]}")
 
-        results.append("  买方经纪商:")
-        for b in bid_brokers[:5]:
-            price = b.get("price", "")
-            broker_ids = b.get("broker_ids", [])
-            results.append(f"    {price}: {broker_ids[:3]}...")
+        if hasattr(resp, 'bid_brokers') and resp.bid_brokers:
+            results.append("  买方经纪商:")
+            for b in resp.bid_brokers[:5]:
+                broker_ids = b.broker_ids if hasattr(b, 'broker_ids') else []
+                results.append(f"    {broker_ids[:5]}")
 
         return "\n".join(results)
 
@@ -2286,7 +2288,7 @@ def get_brokers(symbol: str) -> str:
 @mcp.tool()
 def get_trades(symbol: str, count: int = 20) -> str:
     """
-    获取最近成交明细。
+    获取最近成交明细。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -2295,22 +2297,26 @@ def get_trades(symbol: str, count: int = 20) -> str:
     Returns:
         成交明细
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_trades(target, count)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        trades = resp.get("data", {}).get("trades", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        trades = ctx.trades(target, count)
 
         if not trades:
             return "[i] 无成交明细"
 
         results = [f"**{target} 最近成交**"]
         for t in trades[:10]:
-            price = t.get("price", "")
-            vol = t.get("volume", "")
-            direction = t.get("direction", "")
-            ts = t.get("timestamp", "")
+            price = t.price if hasattr(t, 'price') else ""
+            vol = t.volume if hasattr(t, 'volume') else ""
+            direction = t.direction.name if hasattr(t, 'direction') and t.direction else ""
+            ts = t.timestamp if hasattr(t, 'timestamp') else ""
             results.append(f"  {ts}: {price} x {vol} ({direction})")
 
         return "\n".join(results)
@@ -2325,7 +2331,7 @@ def get_trades(symbol: str, count: int = 20) -> str:
 @mcp.tool()
 def get_intraday(symbol: str) -> str:
     """
-    获取分时数据。
+    获取分时数据。需要 SDK 支持。
 
     Args:
         symbol: 股票代码
@@ -2333,12 +2339,16 @@ def get_intraday(symbol: str) -> str:
     Returns:
         分时数据
     """
-    try:
-        client = get_client()
-        target = to_sdk_symbol(symbol)
-        resp = client.get_intraday(target)
+    if not HAS_SDK:
+        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
 
-        lines = resp.get("data", {}).get("lines", [])
+    try:
+        ctx = get_quote_context()
+        if ctx is None:
+            return "[X] SDK 初始化失败"
+
+        target = to_sdk_symbol(symbol)
+        lines = ctx.intraday(target)
 
         if not lines:
             return "[i] 无分时数据"
@@ -2347,9 +2357,9 @@ def get_intraday(symbol: str) -> str:
 
         # 显示最近10个点
         for l in lines[-10:]:
-            price = l.get("price", "")
-            vol = l.get("volume", "")
-            ts = l.get("timestamp", "")
+            price = l.price if hasattr(l, 'price') else ""
+            vol = l.volume if hasattr(l, 'volume') else ""
+            ts = l.timestamp if hasattr(l, 'timestamp') else ""
             results.append(f"  {ts}: {price} (成交量:{vol})")
 
         results.append(f"  ... 共 {len(lines)} 个数据点")
