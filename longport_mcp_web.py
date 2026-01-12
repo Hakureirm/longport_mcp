@@ -758,7 +758,8 @@ class LongportClient:
 _current_mode: str = "paper"  # 当前账户模式: "paper" 或 "real"
 _paper_client: Optional[LongportClient] = None
 _real_client: Optional[LongportClient] = None
-_quote_ctx = None  # SDK QuoteContext
+_paper_quote_ctx = None  # SDK QuoteContext for paper trading
+_real_quote_ctx = None   # SDK QuoteContext for real trading
 
 
 def _load_default_mode() -> str:
@@ -822,24 +823,41 @@ def get_client() -> LongportClient:
 
 
 def get_quote_context():
-    """获取 SDK QuoteContext 实例（懒加载）"""
-    global _quote_ctx
+    """获取当前模式的 SDK QuoteContext 实例（懒加载）"""
+    global _paper_quote_ctx, _real_quote_ctx, _current_mode
+
     if not HAS_SDK:
         return None
-    if _quote_ctx is None:
-        try:
-            # 尝试从当前模式获取凭证
-            client = get_client()
-            config = Config(
-                app_key=client.app_key,
-                app_secret=client.app_secret,
-                access_token=client.access_token
-            )
-            _quote_ctx = QuoteContext(config)
-        except Exception as e:
-            logger.error(f"SDK QuoteContext 初始化失败: {e}")
-            return None
-    return _quote_ctx
+
+    # 根据当前模式选择对应的 context
+    if _current_mode == "paper":
+        if _paper_quote_ctx is None:
+            try:
+                client = get_client()
+                config = Config(
+                    app_key=client.app_key,
+                    app_secret=client.app_secret,
+                    access_token=client.access_token
+                )
+                _paper_quote_ctx = QuoteContext(config)
+            except Exception as e:
+                logger.error(f"SDK QuoteContext (paper) 初始化失败: {e}")
+                return None
+        return _paper_quote_ctx
+    else:
+        if _real_quote_ctx is None:
+            try:
+                client = get_client()
+                config = Config(
+                    app_key=client.app_key,
+                    app_secret=client.app_secret,
+                    access_token=client.access_token
+                )
+                _real_quote_ctx = QuoteContext(config)
+            except Exception as e:
+                logger.error(f"SDK QuoteContext (real) 初始化失败: {e}")
+                return None
+        return _real_quote_ctx
 
 
 # 初始化时加载默认模式
