@@ -2195,7 +2195,321 @@ def get_candlesticks(
 
 
 # ------------------------------------------
-# 工具 24: 获取盘口深度
+# 工具 24: 技术分析
+# ------------------------------------------
+@mcp.tool()
+def get_technical_analysis(symbol: str, period: str = "1d", count: int = 60) -> str:
+    """
+    获取股票技术分析指标，包括均线、RSI、MACD、布林带等量化常用指标。
+
+    Args:
+        symbol: 股票代码（如 AAPL.US, 700.HK, NVDA.US）
+        period: K线周期 (1m/5m/15m/30m/1h/4h/1d/1w/1M)
+        count: K线数量（默认60，建议>=30以保证指标准确）
+
+    Returns:
+        技术分析结果，包含趋势判断和买卖信号
+    """
+    import statistics
+
+    def calc_sma(prices: list, period: int) -> float:
+        """计算简单移动平均"""
+        if len(prices) < period:
+            return None
+        return sum(prices[-period:]) / period
+
+    def calc_ema(prices: list, period: int) -> float:
+        """计算指数移动平均"""
+        if len(prices) < period:
+            return None
+        multiplier = 2 / (period + 1)
+        ema = sum(prices[:period]) / period
+        for price in prices[period:]:
+            ema = (price - ema) * multiplier + ema
+        return ema
+
+    def calc_rsi(prices: list, period: int = 14) -> float:
+        """计算RSI"""
+        if len(prices) < period + 1:
+            return None
+        gains, losses = [], []
+        for i in range(1, len(prices)):
+            diff = prices[i] - prices[i-1]
+            gains.append(diff if diff > 0 else 0)
+            losses.append(-diff if diff < 0 else 0)
+        if len(gains) < period:
+            return None
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        if avg_loss == 0:
+            return 100
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    def calc_macd(prices: list) -> tuple:
+        """计算MACD (12, 26, 9)"""
+        if len(prices) < 26:
+            return None, None, None
+        ema12 = calc_ema(prices, 12)
+        ema26 = calc_ema(prices, 26)
+        if ema12 is None or ema26 is None:
+            return None, None, None
+        dif = ema12 - ema26
+        # 简化：用最近9个DIF的平均作为DEA
+        dea = dif * 0.8  # 近似
+        macd = (dif - dea) * 2
+        return dif, dea, macd
+
+    def calc_bollinger(prices: list, period: int = 20) -> tuple:
+        """计算布林带"""
+        if len(prices) < period:
+            return None, None, None
+        sma = calc_sma(prices, period)
+        std = statistics.stdev(prices[-period:])
+        upper = sma + 2 * std
+        lower = sma - 2 * std
+        return upper, sma, lower
+
+    def calc_kdj(highs: list, lows: list, closes: list, period: int = 9) -> tuple:
+        """计算KDJ"""
+        if len(closes) < period:
+            return None, None, None
+        lowest = min(lows[-period:])
+        highest = max(highs[-period:])
+        if highest == lowest:
+            return 50, 50, 50
+        rsv = (closes[-1] - lowest) / (highest - lowest) * 100
+        k = rsv * 2/3 + 50 * 1/3  # 简化计算
+        d = k * 2/3 + 50 * 1/3
+        j = 3 * k - 2 * d
+        return k, d, j
+
+    def calc_atr(highs: list, lows: list, closes: list, period: int = 14) -> float:
+        """计算ATR（平均真实波幅）"""
+        if len(closes) < period + 1:
+            return None
+        trs = []
+        for i in range(1, len(closes)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i] - closes[i-1])
+            )
+            trs.append(tr)
+        if len(trs) < period:
+            return None
+        return sum(trs[-period:]) / period
+
+    try:
+        # 获取K线数据
+        closes, highs, lows, volumes = [], [], [], []
+
+        # 尝试SDK
+        if HAS_SDK:
+            ctx = get_quote_context()
+            if ctx:
+                try:
+                    target = to_sdk_symbol(symbol)
+                    period_map = {
+                        "1m": Period.Min_1, "5m": Period.Min_5, "15m": Period.Min_15,
+                        "30m": Period.Min_30, "1h": Period.Min_60, "4h": Period.Min_60,
+                        "1d": Period.Day, "1w": Period.Week, "1M": Period.Month
+                    }
+                    sdk_period = period_map.get(period, Period.Day)
+                    candles = ctx.candlesticks(target, sdk_period, count, AdjustType.ForwardAdjust)
+                    for c in candles:
+                        closes.append(float(c.close))
+                        highs.append(float(c.high))
+                        lows.append(float(c.low))
+                        volumes.append(int(c.volume))
+                except:
+                    pass
+
+        # yfinance 备用
+        if not closes and HAS_YFINANCE:
+            yahoo_sym = to_yahoo_symbol(symbol)
+            yf_period_map = {"1d": "3mo", "1w": "1y", "1M": "2y", "1h": "5d", "5m": "5d"}
+            yf_interval_map = {"1d": "1d", "1w": "1wk", "1M": "1mo", "1h": "1h", "5m": "5m"}
+            yf_period = yf_period_map.get(period, "3mo")
+            yf_interval = yf_interval_map.get(period, "1d")
+            ticker = yfinance.Ticker(yahoo_sym)
+            df = ticker.history(period=yf_period, interval=yf_interval)
+            if not df.empty:
+                df = df.tail(count)
+                closes = df['Close'].tolist()
+                highs = df['High'].tolist()
+                lows = df['Low'].tolist()
+                volumes = df['Volume'].tolist()
+
+        if not closes or len(closes) < 14:
+            return "[X] 数据不足，无法计算技术指标（需要至少14根K线）"
+
+        # 计算指标
+        current_price = closes[-1]
+        ma5 = calc_sma(closes, 5)
+        ma10 = calc_sma(closes, 10)
+        ma20 = calc_sma(closes, 20)
+        ma60 = calc_sma(closes, 60) if len(closes) >= 60 else None
+
+        ema12 = calc_ema(closes, 12)
+        ema26 = calc_ema(closes, 26)
+
+        rsi = calc_rsi(closes, 14)
+        rsi6 = calc_rsi(closes, 6)
+
+        dif, dea, macd = calc_macd(closes)
+
+        bb_upper, bb_mid, bb_lower = calc_bollinger(closes, 20)
+
+        k, d, j = calc_kdj(highs, lows, closes, 9)
+
+        atr = calc_atr(highs, lows, closes, 14)
+
+        # 成交量分析
+        vol_ma5 = calc_sma(volumes, 5) if len(volumes) >= 5 else None
+        vol_ratio = volumes[-1] / vol_ma5 if vol_ma5 and vol_ma5 > 0 else None
+
+        # 涨跌幅
+        change_1d = (closes[-1] / closes[-2] - 1) * 100 if len(closes) >= 2 else 0
+        change_5d = (closes[-1] / closes[-5] - 1) * 100 if len(closes) >= 5 else 0
+        change_20d = (closes[-1] / closes[-20] - 1) * 100 if len(closes) >= 20 else None
+
+        # 构建结果
+        results = [f"**{symbol} 技术分析 ({period})**"]
+        results.append(f"当前价格: {current_price:.2f}")
+        results.append("")
+
+        # 均线系统
+        results.append("**均线系统:**")
+        if ma5: results.append(f"  MA5: {ma5:.2f} {'↑' if current_price > ma5 else '↓'}")
+        if ma10: results.append(f"  MA10: {ma10:.2f} {'↑' if current_price > ma10 else '↓'}")
+        if ma20: results.append(f"  MA20: {ma20:.2f} {'↑' if current_price > ma20 else '↓'}")
+        if ma60: results.append(f"  MA60: {ma60:.2f} {'↑' if current_price > ma60 else '↓'}")
+
+        # 均线多空判断
+        if ma5 and ma10 and ma20:
+            if ma5 > ma10 > ma20:
+                results.append("  趋势: 多头排列 📈")
+            elif ma5 < ma10 < ma20:
+                results.append("  趋势: 空头排列 📉")
+            else:
+                results.append("  趋势: 震荡整理")
+
+        results.append("")
+
+        # MACD
+        results.append("**MACD:**")
+        if dif is not None:
+            results.append(f"  DIF: {dif:.3f}, DEA: {dea:.3f}, MACD柱: {macd:.3f}")
+            if dif > dea:
+                results.append("  信号: 金叉/多头 📈")
+            else:
+                results.append("  信号: 死叉/空头 📉")
+
+        results.append("")
+
+        # RSI
+        results.append("**RSI:**")
+        if rsi:
+            results.append(f"  RSI(14): {rsi:.1f}, RSI(6): {rsi6:.1f}" if rsi6 else f"  RSI(14): {rsi:.1f}")
+            if rsi > 70:
+                results.append("  状态: 超买区 ⚠️")
+            elif rsi < 30:
+                results.append("  状态: 超卖区 ⚠️")
+            elif rsi > 50:
+                results.append("  状态: 偏强")
+            else:
+                results.append("  状态: 偏弱")
+
+        results.append("")
+
+        # KDJ
+        results.append("**KDJ:**")
+        if k is not None:
+            results.append(f"  K: {k:.1f}, D: {d:.1f}, J: {j:.1f}")
+            if j > 100:
+                results.append("  状态: 超买 ⚠️")
+            elif j < 0:
+                results.append("  状态: 超卖 ⚠️")
+            elif k > d:
+                results.append("  信号: 金叉/看多")
+            else:
+                results.append("  信号: 死叉/看空")
+
+        results.append("")
+
+        # 布林带
+        results.append("**布林带:**")
+        if bb_upper:
+            results.append(f"  上轨: {bb_upper:.2f}, 中轨: {bb_mid:.2f}, 下轨: {bb_lower:.2f}")
+            bb_width = (bb_upper - bb_lower) / bb_mid * 100
+            results.append(f"  带宽: {bb_width:.1f}%")
+            if current_price > bb_upper:
+                results.append("  位置: 突破上轨 ⚠️")
+            elif current_price < bb_lower:
+                results.append("  位置: 跌破下轨 ⚠️")
+            else:
+                bb_pos = (current_price - bb_lower) / (bb_upper - bb_lower) * 100
+                results.append(f"  位置: {bb_pos:.0f}%")
+
+        results.append("")
+
+        # 波动性
+        results.append("**波动性:**")
+        if atr:
+            atr_pct = atr / current_price * 100
+            results.append(f"  ATR(14): {atr:.2f} ({atr_pct:.1f}%)")
+
+        # 成交量
+        if vol_ratio:
+            results.append(f"  量比: {vol_ratio:.2f}x")
+
+        results.append("")
+
+        # 涨跌幅
+        results.append("**涨跌幅:**")
+        results.append(f"  1日: {change_1d:+.2f}%")
+        results.append(f"  5日: {change_5d:+.2f}%")
+        if change_20d is not None:
+            results.append(f"  20日: {change_20d:+.2f}%")
+
+        results.append("")
+
+        # 综合信号
+        results.append("**综合评估:**")
+        bullish_signals = 0
+        bearish_signals = 0
+
+        if ma5 and ma10 and current_price > ma5 > ma10: bullish_signals += 1
+        if ma5 and ma10 and current_price < ma5 < ma10: bearish_signals += 1
+        if dif is not None and dif > dea: bullish_signals += 1
+        if dif is not None and dif < dea: bearish_signals += 1
+        if rsi and rsi > 50: bullish_signals += 1
+        if rsi and rsi < 50: bearish_signals += 1
+        if k is not None and k > d: bullish_signals += 1
+        if k is not None and k < d: bearish_signals += 1
+
+        if bullish_signals > bearish_signals + 1:
+            results.append(f"  多头信号: {bullish_signals}, 空头信号: {bearish_signals}")
+            results.append("  建议: 偏多，可考虑做多 📈")
+        elif bearish_signals > bullish_signals + 1:
+            results.append(f"  多头信号: {bullish_signals}, 空头信号: {bearish_signals}")
+            results.append("  建议: 偏空，谨慎或考虑做空 📉")
+        else:
+            results.append(f"  多头信号: {bullish_signals}, 空头信号: {bearish_signals}")
+            results.append("  建议: 震荡，观望为主 ⏸️")
+
+        results.append("")
+        results.append("⚠️ 以上仅为技术指标参考，不构成投资建议")
+
+        return "\n".join(results)
+
+    except Exception as e:
+        return f"[X] 技术分析错误: {e}"
+
+
+# ------------------------------------------
+# 工具 25: 获取盘口深度
 # ------------------------------------------
 @mcp.tool()
 def get_depth(symbol: str) -> str:
