@@ -828,7 +828,13 @@ def get_quote_context():
         return None
     if _quote_ctx is None:
         try:
-            config = Config.from_env()
+            # 尝试从当前模式获取凭证
+            client = get_client()
+            config = Config(
+                app_key=client.app_key,
+                app_secret=client.app_secret,
+                access_token=client.access_token
+            )
             _quote_ctx = QuoteContext(config)
         except Exception as e:
             logger.error(f"SDK QuoteContext 初始化失败: {e}")
