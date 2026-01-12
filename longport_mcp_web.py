@@ -36,7 +36,7 @@ except ImportError:
 
 # 尝试导入 longport SDK（用于高级功能）
 try:
-    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period
+    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period, AdjustType
     HAS_SDK = True
 except ImportError:
     HAS_SDK = False
@@ -1908,7 +1908,7 @@ def get_margin_ratio(symbol: str) -> str:
 
 
 # ------------------------------------------
-# 工具 23: 获取K线数据（使用 yfinance）
+# 工具 23: 获取K线数据（SDK优先，yfinance备用）
 # ------------------------------------------
 @mcp.tool()
 def get_candlesticks(
@@ -1917,39 +1917,72 @@ def get_candlesticks(
     count: int = 30
 ) -> str:
     """
-    获取K线数据。使用 Yahoo Finance 数据源。
+    获取K线数据。优先使用 SDK，失败时使用 yfinance 备用。
 
     Args:
         symbol: 股票代码（如 AAPL.US, 700.HK, ORCL.US）
-        period: K线周期 (1d=日线, 1wk=周线, 1mo=月线)
+        period: K线周期 (1d=日线, 1w=周线, 1M=月线)
         count: K线数量（默认30根）
 
     Returns:
         K线数据（开高低收+成交量）
     """
+    target = to_sdk_symbol(symbol)
+
+    # 优先尝试 SDK
+    if HAS_SDK:
+        try:
+            ctx = get_quote_context()
+            if ctx is not None:
+                # SDK Period 映射
+                period_map = {
+                    "1m": Period.Min_1, "5m": Period.Min_5, "15m": Period.Min_15,
+                    "30m": Period.Min_30, "60m": Period.Min_60,
+                    "1d": Period.Day, "day": Period.Day,
+                    "1w": Period.Week, "week": Period.Week,
+                    "1M": Period.Month, "month": Period.Month,
+                    "1y": Period.Year, "year": Period.Year,
+                }
+                sdk_period = period_map.get(period.lower(), Period.Day)
+
+                candles = ctx.candlesticks(target, sdk_period, count, AdjustType.ForwardAdjust)
+
+                if candles:
+                    results = [f"**{target} {period} K线 (SDK, 最近{len(candles)}根)**"]
+                    for c in candles[-count:]:
+                        date_str = c.timestamp.strftime("%Y-%m-%d")
+                        o = f"{c.open:.2f}"
+                        h = f"{c.high:.2f}"
+                        l = f"{c.low:.2f}"
+                        close = f"{c.close:.2f}"
+                        v = f"{int(c.volume):,}"
+                        results.append(f"  {date_str}: O:{o} H:{h} L:{l} C:{close} V:{v}")
+                    return "\n".join(results)
+        except Exception as e:
+            logger.warning(f"SDK K线获取失败，切换到 yfinance: {e}")
+
+    # yfinance 备用
     if not HAS_YFINANCE:
-        return "[X] yfinance 未安装，无法获取K线。安装: pip install yfinance"
+        return "[X] 无法获取K线: SDK不可用且yfinance未安装"
 
     try:
-        # 转换为 Yahoo Finance 格式
-        target = to_sdk_symbol(symbol)
         yahoo_symbol = to_yahoo_symbol(target)
 
-        # 周期映射
+        # yfinance 周期映射
         interval_map = {
             "1d": "1d", "day": "1d", "daily": "1d",
             "1w": "1wk", "1wk": "1wk", "week": "1wk", "weekly": "1wk",
-            "1m": "1mo", "1mo": "1mo", "month": "1mo", "monthly": "1mo",
+            "1m": "1mo", "1mo": "1mo", "1M": "1mo", "month": "1mo", "monthly": "1mo",
         }
         interval = interval_map.get(period.lower(), "1d")
 
         # 根据周期决定获取多长时间的数据
         if interval == "1d":
-            period_str = f"{min(count, 60)}d"  # 最多60天日线
+            period_str = f"{min(count, 60)}d"
         elif interval == "1wk":
-            period_str = f"{min(count * 7, 365)}d"  # 周线
+            period_str = f"{min(count * 7, 365)}d"
         else:
-            period_str = f"{min(count * 30, 730)}d"  # 月线
+            period_str = f"{min(count * 30, 730)}d"
 
         ticker = yf.Ticker(yahoo_symbol)
         df = ticker.history(period=period_str, interval=interval)
@@ -1957,10 +1990,8 @@ def get_candlesticks(
         if df.empty:
             return f"[X] 无K线数据: {symbol}"
 
-        # 只取最近 count 根
         df = df.tail(count)
-
-        results = [f"**{target} {period} K线 (最近{len(df)}根)**"]
+        results = [f"**{target} {period} K线 (yfinance, 最近{len(df)}根)**"]
 
         for idx, row in df.iterrows():
             date_str = idx.strftime("%Y-%m-%d")
