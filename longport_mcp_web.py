@@ -94,22 +94,56 @@ class LongportClient:
     2. 生成符合文档要求的签名 Header
     3. 封装 GET/POST/PUT/DELETE 方法
     4. 处理 JSON 序列化和错误回显
+
+    配置文件格式（支持双账户）：
+    {
+        "paper": {
+            "app_key": "xxx",
+            "app_secret": "xxx",
+            "access_token": "xxx"
+        },
+        "real": {
+            "app_key": "xxx",
+            "app_secret": "xxx",
+            "access_token": "xxx"
+        },
+        "default_mode": "paper"
+    }
+
+    也支持旧的单账户格式（向后兼容）：
+    {
+        "app_key": "xxx",
+        "app_secret": "xxx",
+        "access_token": "xxx"
+    }
     """
 
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config_path: Optional[str] = None, mode: str = "paper"):
         """
         初始化客户端
 
         Args:
             config_path: 配置文件路径，默认为当前目录下的 longport_config.json
+            mode: 账户模式，"paper"=模拟盘，"real"=实盘
         """
+        self.mode = mode
         self.config = self._load_config(config_path)
-        self.app_key = self.config.get("app_key") or os.getenv("LONGPORT_APP_KEY")
-        self.app_secret = self.config.get("app_secret") or os.getenv("LONGPORT_APP_SECRET")
-        self.access_token = self.config.get("access_token") or os.getenv("LONGPORT_ACCESS_TOKEN")
+
+        # 检查是否为新格式（双账户）
+        if "paper" in self.config or "real" in self.config:
+            # 新格式：从对应模式获取凭证
+            mode_config = self.config.get(mode, {})
+            self.app_key = mode_config.get("app_key")
+            self.app_secret = mode_config.get("app_secret")
+            self.access_token = mode_config.get("access_token")
+        else:
+            # 旧格式：向后兼容
+            self.app_key = self.config.get("app_key") or os.getenv("LONGPORT_APP_KEY")
+            self.app_secret = self.config.get("app_secret") or os.getenv("LONGPORT_APP_SECRET")
+            self.access_token = self.config.get("access_token") or os.getenv("LONGPORT_ACCESS_TOKEN")
 
         if not all([self.app_key, self.app_secret, self.access_token]):
-            raise ValueError("缺少必要的配置: app_key, app_secret, access_token")
+            raise ValueError(f"缺少必要的配置 ({mode}): app_key, app_secret, access_token")
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -704,15 +738,65 @@ class LongportClient:
 
 
 # ================= 全局客户端实例 =================
-_client: Optional[LongportClient] = None
+_current_mode: str = "paper"  # 当前账户模式: "paper" 或 "real"
+_paper_client: Optional[LongportClient] = None
+_real_client: Optional[LongportClient] = None
 _quote_ctx = None  # SDK QuoteContext
 
+
+def _load_default_mode() -> str:
+    """从配置文件加载默认模式"""
+    paths_to_try = [
+        CONFIG_FILE,
+        os.path.join(os.path.dirname(__file__), CONFIG_FILE),
+        os.path.expanduser(f"~/{CONFIG_FILE}"),
+    ]
+    for path in paths_to_try:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    return config.get("default_mode", "paper")
+            except Exception:
+                pass
+    return "paper"
+
+
+def get_current_mode() -> str:
+    """获取当前账户模式"""
+    return _current_mode
+
+
+def set_current_mode(mode: str) -> bool:
+    """
+    设置当前账户模式
+
+    Args:
+        mode: "paper" 或 "real"
+
+    Returns:
+        是否成功
+    """
+    global _current_mode
+    if mode not in ["paper", "real"]:
+        return False
+    _current_mode = mode
+    return True
+
+
 def get_client() -> LongportClient:
-    """获取全局 REST API 客户端实例（懒加载）"""
-    global _client
-    if _client is None:
-        _client = LongportClient()
-    return _client
+    """获取当前模式的 REST API 客户端实例（懒加载）"""
+    global _paper_client, _real_client, _current_mode
+
+    if _current_mode == "paper":
+        if _paper_client is None:
+            _paper_client = LongportClient(mode="paper")
+        return _paper_client
+    else:
+        if _real_client is None:
+            _real_client = LongportClient(mode="real")
+        return _real_client
+
 
 def get_quote_context():
     """获取 SDK QuoteContext 实例（懒加载）"""
@@ -727,6 +811,10 @@ def get_quote_context():
             logger.error(f"SDK QuoteContext 初始化失败: {e}")
             return None
     return _quote_ctx
+
+
+# 初始化时加载默认模式
+_current_mode = _load_default_mode()
 # =================================================
 
 
@@ -1105,10 +1193,13 @@ def place_order(
     Returns:
         交易结果
     """
+    mode = get_current_mode()
+    mode_label = "[模拟盘]" if mode == "paper" else "[实盘]"
+
     result = _core_execute_trade(symbol, side, quantity, price, "Manual")
     if result:
-        return f"[OK] 订单已提交，ID: {result}"
-    return "[X] 下单失败，请检查日志"
+        return f"{mode_label} [OK] 订单已提交，ID: {result}"
+    return f"{mode_label} [X] 下单失败，请检查日志"
 
 
 # ------------------------------------------
@@ -2733,6 +2824,86 @@ def check_sdk_status() -> str:
         results.append(f"  [X] REST API 初始化失败: {e}")
 
     return "\n".join(results)
+
+
+# ------------------------------------------
+# 工具 40: 获取当前账户模式
+# ------------------------------------------
+@mcp.tool()
+def get_account_mode() -> str:
+    """
+    获取当前账户模式（模拟盘/实盘）。
+
+    Returns:
+        当前模式信息
+    """
+    mode = get_current_mode()
+    mode_name = "模拟盘 (Paper Trading)" if mode == "paper" else "实盘 (Real Trading)"
+
+    try:
+        client = get_client()
+        status = "[OK] 已连接"
+    except Exception as e:
+        status = f"[X] 未连接: {e}"
+
+    return (
+        f"**当前账户模式**\n"
+        f"  模式: {mode_name}\n"
+        f"  状态: {status}\n"
+        f"\n"
+        f"切换模式请使用 switch_account_mode 工具"
+    )
+
+
+# ------------------------------------------
+# 工具 41: 切换账户模式
+# ------------------------------------------
+@mcp.tool()
+def switch_account_mode(mode: str) -> str:
+    """
+    切换账户模式（模拟盘/实盘）。
+
+    重要提示：
+    - paper: 模拟盘，用于测试和学习，不涉及真实资金
+    - real: 实盘，涉及真实资金交易，请谨慎操作！
+
+    Args:
+        mode: 目标模式，"paper"=模拟盘，"real"=实盘
+
+    Returns:
+        切换结果
+    """
+    mode = mode.lower().strip()
+
+    if mode not in ["paper", "real"]:
+        return "[X] 无效模式，请使用 'paper'(模拟盘) 或 'real'(实盘)"
+
+    old_mode = get_current_mode()
+    if old_mode == mode:
+        mode_name = "模拟盘" if mode == "paper" else "实盘"
+        return f"[i] 已经处于{mode_name}模式"
+
+    # 切换模式
+    if set_current_mode(mode):
+        if mode == "real":
+            return (
+                "**[!] 已切换到实盘模式**\n"
+                "\n"
+                "⚠️ 警告：您现在处于实盘交易模式！\n"
+                "  - 所有交易操作将使用真实资金\n"
+                "  - 请仔细核对每笔订单\n"
+                "  - 如需返回模拟盘，请使用 switch_account_mode('paper')"
+            )
+        else:
+            return (
+                "**[OK] 已切换到模拟盘模式**\n"
+                "\n"
+                "当前为模拟盘环境：\n"
+                "  - 所有交易为模拟操作\n"
+                "  - 不涉及真实资金"
+            )
+    else:
+        return "[X] 切换失败，请检查配置文件"
 
 
 # ================= 主入口 =================
