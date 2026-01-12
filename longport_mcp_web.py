@@ -684,6 +684,7 @@ class LongportClient:
         return self.get("/v1/trade/estimate/buy_limit", params)
 
 
+
 # ================= 全局客户端实例 =================
 _client: Optional[LongportClient] = None
 
@@ -2273,6 +2274,31 @@ def get_today_all_orders() -> str:
 
     except Exception as e:
         return f"[X] 今日订单查询失败: {e}"
+
+
+# ------------------------------------------
+# 工具 35: 获取当前时间
+# ------------------------------------------
+@mcp.tool()
+def get_current_time() -> str:
+    """
+    获取当前时间（用于调试和时间计算）。
+
+    Returns:
+        当前时间信息
+    """
+    from datetime import datetime
+    import time
+
+    now = datetime.now()
+    utc_now = datetime.utcnow()
+
+    return (
+        f"**当前时间**\n"
+        f"  本地: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"  UTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"  时间戳: {int(time.time())}"
+    )
 
 
 # ================= 主入口 =================
