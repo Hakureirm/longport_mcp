@@ -1,6 +1,6 @@
 [project]
 name = "longport-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "Longport/Longbridge Trading MCP Server - OAuth 2.0 + REST/SDK hybrid"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -61,3 +61,6 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "integration: needs Longbridge paper secrets (LONGBRIDGE_PAPER_*)",
+]

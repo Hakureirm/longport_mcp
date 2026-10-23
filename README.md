@@ -11,6 +11,12 @@
 - **yfinance 备用**: 行情数据支持 yfinance 作为备用源，可查询加密货币
 - **uvx 一键部署**: 无需复杂配置
 
+## 0.5.1 更新说明 / Changelog (CI)
+
+- 新增 GitHub Actions CI（`.github/workflows/ci.yml`）：多版本 unit smoke + 可选 paper 联调
+- pytest marker `integration`；无仓库 secrets 时 paper job 跳过
+- **勿将密钥写入仓库**；仅用 GitHub Actions repository secrets（模拟盘）
+
 ## 0.5.0 更新说明 / Changelog (OAuth 2.0)
 
 在 0.4.0（Longbridge SDK 5.x）之上，对齐官方推荐的 OAuth 2.0 认证：
@@ -285,11 +291,54 @@ A股: 600519.SH, 000001.SZ
 2. 创建应用获取 `app_key` 和 `app_secret`
 3. 生成 `access_token`（模拟盘和实盘分别生成）
 
+
+## CI & Secrets（GitHub Actions）
+
+仓库已配置 `.github/workflows/ci.yml`：
+
+| Job | 何时运行 | 做什么 |
+|-----|----------|--------|
+| `unit` | push `main` / 本分支、对 `main` 的 PR | Python 3.10–3.13，`pytest -m "not integration"` |
+| `paper-integration` | 仅当仓库 secret `LONGBRIDGE_PAPER_ACCESS_TOKEN` 非空 | 只读模拟盘联调（资产 / SDK 状态）；**默认不下单** |
+
+### 需要配置的 Secrets
+
+在 GitHub → **Settings → Secrets and variables → Actions** 中新增（**仅模拟盘 / paper**）：
+
+| Secret 名称 | 说明 |
+|-------------|------|
+| `LONGBRIDGE_PAPER_APP_KEY` | 模拟盘 App Key |
+| `LONGBRIDGE_PAPER_APP_SECRET` | 模拟盘 App Secret |
+| `LONGBRIDGE_PAPER_ACCESS_TOKEN` | 模拟盘 Access Token |
+
+可选：
+
+| Secret 名称 | 说明 |
+|-------------|------|
+| `LONGBRIDGE_HTTP_URL` | 例如 `https://openapi.longbridge.cn`（大陆网络） |
+| `LONGBRIDGE_REGION` | 如 `cn` / `hk` |
+| `LONGBRIDGE_PAPER_ALLOW_ORDER` | 设为 `1` 才允许 CI 尝试下单（**默认不要设置**） |
+
+**安全要求**
+
+- 只用 **paper / 模拟盘** 凭证；不要放实盘 / live keys
+- **永远不要**把 key/secret/token 提交进 git、README 或 Issue
+- Fork 来的 PR 通常读不到 secrets，`paper-integration` 会跳过（属预期）
+
+本地跑联调（自行 export，勿入库）：
+
+```bash
+export LONGBRIDGE_PAPER_APP_KEY=...
+export LONGBRIDGE_PAPER_APP_SECRET=...
+export LONGBRIDGE_PAPER_ACCESS_TOKEN=...
+pytest -q -m integration
+```
+
 ## 本地校验（无需真实凭证）
 
 ```bash
 pip install -e ".[dev]"
-pytest -q
+pytest -q -m "not integration"
 python -c "import longport_mcp_web as m; print('HAS_SDK', m.HAS_SDK); print(m.get_auth_mode()); print(m.oauth_status())"
 ```
 
