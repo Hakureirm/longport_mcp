@@ -2,12 +2,13 @@
 """
 Longport MCP Server - Hybrid Version
 =====================================
-长桥证券 MCP 服务，支持 REST API + SDK 混合模式。
-- REST API: 交易、资产、持仓、订单
-- SDK (可选): 交易日历、资金流向、实时推送等高级功能
+长桥 / Longbridge 证券 MCP 服务，支持 REST API + SDK 混合模式。
+- REST API: 交易、资产、持仓、订单（HMAC 签名；模拟盘附带 x-papertrading）
+- SDK (可选, longbridge>=5.x): 行情深度/K线、资金流向、基本面/日历/市场状态等
 
-配置方式：
-1. 环境变量（推荐）: LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
+配置方式（LONGBRIDGE_* 优先，LONGPORT_* 仍兼容）：
+1. 环境变量: LONGBRIDGE_APP_KEY / LONGBRIDGE_APP_SECRET / LONGBRIDGE_ACCESS_TOKEN
+   双账户: LONGBRIDGE_PAPER_* 与 LONGBRIDGE_REAL_*
 2. 配置文件: longport_config.json
 """
 
@@ -34,12 +35,27 @@ try:
 except ImportError:
     HAS_YFINANCE = False
 
-# 尝试导入 longport SDK（用于高级功能）
+# 尝试导入 longbridge SDK（原 PyPI 包 longport 已更名为 longbridge）
 try:
-    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period, AdjustType
+    from longbridge.openapi import (
+        Config,
+        QuoteContext,
+        TradeContext,
+        Market,
+        Period,
+        AdjustType,
+        CalendarContext,
+        CalendarCategory,
+        FundamentalContext,
+        MarketContext,
+        PortfolioContext,
+    )
     HAS_SDK = True
 except ImportError:
     HAS_SDK = False
+    Config = QuoteContext = TradeContext = Market = Period = AdjustType = None  # type: ignore
+    CalendarContext = CalendarCategory = FundamentalContext = None  # type: ignore
+    MarketContext = PortfolioContext = None  # type: ignore
 
 # ================= 配置区域 =================
 logging.basicConfig(
@@ -51,8 +67,22 @@ logger = logging.getLogger("longport_mcp")
 # ===========================================
 
 # ================= 常量定义 =================
-BASE_URL = "https://openapi.longportapp.com"
+# 官方 HTTP 主机已迁移至 openapi.longbridge.com（可用环境变量覆盖）
+BASE_URL = (
+    os.getenv("LONGBRIDGE_HTTP_URL")
+    or os.getenv("LONGPORT_HTTP_URL")
+    or "https://openapi.longbridge.com"
+)
 CONFIG_FILE = "longport_config.json"
+
+
+def _env(*names: str, default: str = "") -> str:
+    """按优先级读取环境变量（支持 LONGBRIDGE_* / LONGPORT_* 双前缀）。"""
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
 
 # 订单类型映射
 ORDER_TYPE_MAP = {
@@ -126,13 +156,13 @@ class LongportClient:
             config_path: 配置文件路径，默认为当前目录下的 longport_config.json
             mode: 账户模式，"paper"=模拟盘，"real"=实盘
 
-        支持的环境变量（双账户模式）：
-            LONGPORT_PAPER_APP_KEY, LONGPORT_PAPER_APP_SECRET, LONGPORT_PAPER_ACCESS_TOKEN
-            LONGPORT_REAL_APP_KEY, LONGPORT_REAL_APP_SECRET, LONGPORT_REAL_ACCESS_TOKEN
-            LONGPORT_DEFAULT_MODE (可选，默认 "paper")
+        支持的环境变量（双账户模式，LONGBRIDGE_* 优先，LONGPORT_* 兼容）：
+            LONGBRIDGE_PAPER_* / LONGPORT_PAPER_* (APP_KEY / APP_SECRET / ACCESS_TOKEN)
+            LONGBRIDGE_REAL_* / LONGPORT_REAL_* (APP_KEY / APP_SECRET / ACCESS_TOKEN)
+            LONGBRIDGE_DEFAULT_MODE / LONGPORT_DEFAULT_MODE (可选，默认 "paper")
 
-        也支持旧的单账户环境变量：
-            LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
+        也支持单账户环境变量：
+            LONGBRIDGE_APP_KEY / LONGPORT_APP_KEY 及对应 SECRET / TOKEN
         """
         self.mode = mode
         self.config = self._load_config(config_path)
@@ -153,11 +183,26 @@ class LongportClient:
         # 如果配置文件没有，尝试环境变量（带模式前缀）
         mode_upper = mode.upper()
         if not self.app_key:
-            self.app_key = os.getenv(f"LONGPORT_{mode_upper}_APP_KEY") or os.getenv("LONGPORT_APP_KEY")
+            self.app_key = _env(
+                f"LONGBRIDGE_{mode_upper}_APP_KEY",
+                f"LONGPORT_{mode_upper}_APP_KEY",
+                "LONGBRIDGE_APP_KEY",
+                "LONGPORT_APP_KEY",
+            )
         if not self.app_secret:
-            self.app_secret = os.getenv(f"LONGPORT_{mode_upper}_APP_SECRET") or os.getenv("LONGPORT_APP_SECRET")
+            self.app_secret = _env(
+                f"LONGBRIDGE_{mode_upper}_APP_SECRET",
+                f"LONGPORT_{mode_upper}_APP_SECRET",
+                "LONGBRIDGE_APP_SECRET",
+                "LONGPORT_APP_SECRET",
+            )
         if not self.access_token:
-            self.access_token = os.getenv(f"LONGPORT_{mode_upper}_ACCESS_TOKEN") or os.getenv("LONGPORT_ACCESS_TOKEN")
+            self.access_token = _env(
+                f"LONGBRIDGE_{mode_upper}_ACCESS_TOKEN",
+                f"LONGPORT_{mode_upper}_ACCESS_TOKEN",
+                "LONGBRIDGE_ACCESS_TOKEN",
+                "LONGPORT_ACCESS_TOKEN",
+            )
 
         if not all([self.app_key, self.app_secret, self.access_token]):
             raise ValueError(f"缺少必要的配置 ({mode}): app_key, app_secret, access_token")
@@ -239,13 +284,17 @@ class LongportClient:
         """构建请求头"""
         timestamp, signature = self._generate_signature(method, uri, params, body)
 
-        return {
+        headers = {
             "X-Api-Key": self.app_key,
             "Authorization": self.access_token,
             "X-Timestamp": timestamp,
             "X-Api-Signature": signature,
-            "Content-Type": "application/json; charset=utf-8"
+            "Content-Type": "application/json; charset=utf-8",
         }
+        # 与 SDK enable_papertrading 对齐：模拟盘 REST 请求声明纸交易环境
+        if getattr(self, "mode", "paper") == "paper":
+            headers["x-papertrading"] = "true"
+        return headers
 
     def _handle_response(self, response: requests.Response) -> Dict[str, Any]:
         """
@@ -758,14 +807,14 @@ class LongportClient:
 _current_mode: str = "paper"  # 当前账户模式: "paper" 或 "real"
 _paper_client: Optional[LongportClient] = None
 _real_client: Optional[LongportClient] = None
-_paper_quote_ctx = None  # SDK QuoteContext for paper trading
-_real_quote_ctx = None   # SDK QuoteContext for real trading
+# SDK contexts cache: mode -> {quote, calendar, fundamental, market, portfolio}
+_sdk_ctx_cache: Dict[str, Dict[str, Any]] = {"paper": {}, "real": {}}
 
 
 def _load_default_mode() -> str:
     """从环境变量或配置文件加载默认模式"""
     # 优先使用环境变量
-    env_mode = os.getenv("LONGPORT_DEFAULT_MODE", "").lower()
+    env_mode = _env("LONGBRIDGE_DEFAULT_MODE", "LONGPORT_DEFAULT_MODE").lower()
     if env_mode in ["paper", "real"]:
         return env_mode
 
@@ -822,46 +871,67 @@ def get_client() -> LongportClient:
         return _real_client
 
 
-def get_quote_context():
-    """获取当前模式的 SDK QuoteContext 实例（懒加载）"""
-    global _paper_quote_ctx, _real_quote_ctx, _current_mode
+def _build_sdk_config(mode: Optional[str] = None):
+    """
+    构建 longbridge SDK Config。
+
+    longbridge 5.x 不再支持 Config(app_key=...) 构造，必须使用 Config.from_apikey。
+    模拟盘启用 enable_papertrading，与 REST 的 x-papertrading 头一致。
+    """
+    if not HAS_SDK:
+        return None
+    mode = mode or _current_mode
+    client = get_client() if mode == _current_mode else LongportClient(mode=mode)
+    http_url = _env("LONGBRIDGE_HTTP_URL", "LONGPORT_HTTP_URL", default=BASE_URL) or None
+    return Config.from_apikey(
+        client.app_key,
+        client.app_secret,
+        client.access_token,
+        http_url=http_url,
+        enable_papertrading=(mode == "paper"),
+        enable_print_quote_packages=False,
+    )
+
+
+def _get_sdk_context(kind: str):
+    """懒加载当前模式的 SDK Context（quote/calendar/fundamental/market/portfolio）。"""
+    global _sdk_ctx_cache, _current_mode
 
     if not HAS_SDK:
         return None
 
-    # 根据当前模式选择对应的 context
-    if _current_mode == "paper":
-        if _paper_quote_ctx is None:
-            try:
-                client = get_client()
-                logger.info(f"SDK初始化 (paper): app_key={client.app_key[:8] if client.app_key else 'None'}...")
-                config = Config(
-                    app_key=client.app_key,
-                    app_secret=client.app_secret,
-                    access_token=client.access_token
-                )
-                _paper_quote_ctx = QuoteContext(config)
-                logger.info("SDK QuoteContext (paper) 初始化成功")
-            except Exception as e:
-                logger.error(f"SDK QuoteContext (paper) 初始化失败: {e}")
-                return None
-        return _paper_quote_ctx
-    else:
-        if _real_quote_ctx is None:
-            try:
-                client = get_client()
-                logger.info(f"SDK初始化 (real): app_key={client.app_key[:8] if client.app_key else 'None'}...")
-                config = Config(
-                    app_key=client.app_key,
-                    app_secret=client.app_secret,
-                    access_token=client.access_token
-                )
-                _real_quote_ctx = QuoteContext(config)
-                logger.info("SDK QuoteContext (real) 初始化成功")
-            except Exception as e:
-                logger.error(f"SDK QuoteContext (real) 初始化失败: {e}")
-                return None
-        return _real_quote_ctx
+    bucket = _sdk_ctx_cache.setdefault(_current_mode, {})
+    if kind in bucket:
+        return bucket[kind]
+
+    factories = {
+        "quote": QuoteContext,
+        "calendar": CalendarContext,
+        "fundamental": FundamentalContext,
+        "market": MarketContext,
+        "portfolio": PortfolioContext,
+    }
+    cls = factories.get(kind)
+    if cls is None:
+        return None
+
+    try:
+        config = _build_sdk_config(_current_mode)
+        if config is None:
+            return None
+        logger.info(f"SDK {cls.__name__} 初始化 ({_current_mode})...")
+        ctx = cls(config)
+        bucket[kind] = ctx
+        logger.info(f"SDK {cls.__name__} ({_current_mode}) 初始化成功")
+        return ctx
+    except Exception as e:
+        logger.error(f"SDK {cls.__name__} ({_current_mode}) 初始化失败: {e}")
+        return None
+
+
+def get_quote_context():
+    """获取当前模式的 SDK QuoteContext 实例（懒加载）"""
+    return _get_sdk_context("quote")
 
 
 # 初始化时加载默认模式
@@ -2093,6 +2163,28 @@ def get_margin_ratio(symbol: str) -> str:
         return f"[X] 保证金查询错误: {e}"
 
 
+
+def _resolve_sdk_period(period: str):
+    """将用户周期字符串映射为 SDK Period（区分 1m 分钟与 1M 月）。"""
+    if not HAS_SDK or Period is None:
+        raise RuntimeError("longbridge SDK unavailable")
+    raw = (period or "1d").strip()
+    key = raw.lower()
+    # 月线常用 1M / M / mon —— 避免被 lower() 成 1m 后误判为 1 分钟
+    if raw in ("1M", "M") or key in ("month", "mon", "1mo", "monthly"):
+        return Period.Month
+    period_map = {
+        "1m": Period.Min_1, "1min": Period.Min_1, "min": Period.Min_1,
+        "5m": Period.Min_5, "15m": Period.Min_15,
+        "30m": Period.Min_30, "60m": Period.Min_60, "1h": Period.Min_60,
+        "2h": Period.Min_120, "4h": Period.Min_240,
+        "1d": Period.Day, "day": Period.Day, "daily": Period.Day, "d": Period.Day,
+        "1w": Period.Week, "week": Period.Week, "weekly": Period.Week, "w": Period.Week,
+        "1q": Period.Quarter, "quarter": Period.Quarter, "q": Period.Quarter,
+        "1y": Period.Year, "year": Period.Year, "yearly": Period.Year, "y": Period.Year,
+    }
+    return period_map.get(key, Period.Day)
+
 # ------------------------------------------
 # 工具 23: 获取K线数据（SDK优先，yfinance备用）
 # ------------------------------------------
@@ -2120,16 +2212,7 @@ def get_candlesticks(
         try:
             ctx = get_quote_context()
             if ctx is not None:
-                # SDK Period 映射
-                period_map = {
-                    "1m": Period.Min_1, "5m": Period.Min_5, "15m": Period.Min_15,
-                    "30m": Period.Min_30, "60m": Period.Min_60,
-                    "1d": Period.Day, "day": Period.Day,
-                    "1w": Period.Week, "week": Period.Week,
-                    "1M": Period.Month, "month": Period.Month,
-                    "1y": Period.Year, "year": Period.Year,
-                }
-                sdk_period = period_map.get(period.lower(), Period.Day)
+                sdk_period = _resolve_sdk_period(period)
 
                 candles = ctx.candlesticks(target, sdk_period, count, AdjustType.ForwardAdjust)
 
@@ -2310,12 +2393,7 @@ def get_technical_analysis(symbol: str, period: str = "1d", count: int = 60) -> 
             if ctx:
                 try:
                     target = to_sdk_symbol(symbol)
-                    period_map = {
-                        "1m": Period.Min_1, "5m": Period.Min_5, "15m": Period.Min_15,
-                        "30m": Period.Min_30, "1h": Period.Min_60, "4h": Period.Min_60,
-                        "1d": Period.Day, "1w": Period.Week, "1M": Period.Month
-                    }
-                    sdk_period = period_map.get(period, Period.Day)
+                    sdk_period = _resolve_sdk_period(period)
                     candles = ctx.candlesticks(target, sdk_period, count, AdjustType.ForwardAdjust)
                     for c in candles:
                         closes.append(float(c.close))
@@ -2523,7 +2601,7 @@ def get_depth(symbol: str) -> str:
         盘口深度信息
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2566,7 +2644,7 @@ def get_brokers(symbol: str) -> str:
         经纪商队列信息
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2612,7 +2690,7 @@ def get_trades(symbol: str, count: int = 20) -> str:
         成交明细
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2655,7 +2733,7 @@ def get_intraday(symbol: str) -> str:
         分时数据
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2892,10 +2970,14 @@ def submit_order_advanced(
         resp = client.post("/v1/trade/order", data)
         order_id = resp.get("data", {}).get("order_id")
 
-        return f"[OK] 高级订单已提交，ID: {order_id}"
+        mode = get_current_mode()
+        mode_label = "[模拟盘]" if mode == "paper" else "[实盘]"
+        return f"{mode_label} [OK] 高级订单已提交，ID: {order_id}"
 
     except Exception as e:
-        return f"[X] 高级下单失败: {e}"
+        mode = get_current_mode()
+        mode_label = "[模拟盘]" if mode == "paper" else "[实盘]"
+        return f"{mode_label} [X] 高级下单失败: {e}"
 
 
 # ------------------------------------------
@@ -2997,7 +3079,7 @@ def get_current_time() -> str:
 
 
 # ==================== SDK 增强功能 ====================
-# 以下工具需要 longport SDK 支持，提供更丰富的行情数据
+# 以下工具需要 longbridge SDK 支持，提供更丰富的行情数据
 
 # ------------------------------------------
 # 工具 36: 获取交易日历 (SDK)
@@ -3020,7 +3102,7 @@ def get_trading_days(
         交易日列表
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         from datetime import date
@@ -3093,7 +3175,7 @@ def get_capital_flow(symbol: str) -> str:
         资金流向信息
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -3138,7 +3220,7 @@ def get_capital_distribution(symbol: str) -> str:
         资金分布信息（大单/中单/小单）
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -3171,6 +3253,178 @@ def get_capital_distribution(symbol: str) -> str:
         return f"[X] 资金分布查询错误: {e}"
 
 
+
+# ------------------------------------------
+# 工具: 市场交易状态 (SDK MarketContext, longbridge 4.1+)
+# ------------------------------------------
+@mcp.tool()
+def get_market_status() -> str:
+    """
+    获取各市场当前交易状态（需要 longbridge SDK）。
+
+    Returns:
+        各市场交易状态列表
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
+
+    try:
+        ctx = _get_sdk_context("market")
+        if ctx is None:
+            return "[X] SDK MarketContext 初始化失败，请检查环境变量配置"
+
+        resp = ctx.market_status()
+        items = getattr(resp, "market_time", None) or []
+        if not items:
+            return "[i] 无市场状态数据"
+
+        results = ["**市场交易状态**"]
+        for item in items:
+            market = getattr(item, "market", "?")
+            status = getattr(item, "trade_status", "?")
+            ts = getattr(item, "timestamp", "")
+            results.append(f"  {market}: status={status}, ts={ts}")
+        return "\n".join(results)
+    except Exception as e:
+        return f"[X] 市场状态查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具: 公司概览 (SDK FundamentalContext, longbridge 4.1+)
+# ------------------------------------------
+@mcp.tool()
+def get_company_info(symbol: str) -> str:
+    """
+    获取公司概览（需要 longbridge SDK FundamentalContext）。
+
+    Args:
+        symbol: 股票代码，如 700.HK / AAPL.US
+
+    Returns:
+        公司名称、上市信息、简介等
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
+
+    try:
+        ctx = _get_sdk_context("fundamental")
+        if ctx is None:
+            return "[X] SDK FundamentalContext 初始化失败，请检查环境变量配置"
+
+        target = to_sdk_symbol(symbol)
+        info = ctx.company(target)
+        results = [f"**{target} 公司概览**"]
+        mapping = [
+            ("名称", "name"),
+            ("全称", "company_name"),
+            ("市场", "market"),
+            ("地区", "region"),
+            ("成立", "founded"),
+            ("上市", "listing_date"),
+            ("官网", "website"),
+            ("发行价", "issue_price"),
+        ]
+        for label, attr in mapping:
+            val = getattr(info, attr, None)
+            if val:
+                results.append(f"  {label}: {val}")
+        for attr in ("description", "profile", "intro", "business"):
+            val = getattr(info, attr, None)
+            if val:
+                text = str(val).strip()
+                if len(text) > 400:
+                    text = text[:400] + "..."
+                results.append(f"  简介: {text}")
+                break
+        return "\n".join(results) if len(results) > 1 else f"[i] {target} 无公司概览数据"
+    except Exception as e:
+        return f"[X] 公司概览查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具: 财经日历 (SDK CalendarContext, longbridge 4.1+)
+# ------------------------------------------
+@mcp.tool()
+def get_finance_calendar(
+    category: str = "report",
+    start_date: str = "",
+    end_date: str = "",
+    market: str = "",
+    count: int = 20,
+) -> str:
+    """
+    获取财经日历事件（需要 longbridge SDK CalendarContext）。
+
+    Args:
+        category: 事件类型 report/dividend/split/ipo/macro/closed/meeting
+        start_date: 开始日期 YYYY-MM-DD（默认今天）
+        end_date: 结束日期 YYYY-MM-DD（默认 14 天后）
+        market: 可选市场过滤，如 US/HK/CN/SG
+        count: 返回条数上限（默认 20）
+
+    Returns:
+        按日分组的财经事件
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
+
+    try:
+        from datetime import date, timedelta
+
+        ctx = _get_sdk_context("calendar")
+        if ctx is None:
+            return "[X] SDK CalendarContext 初始化失败，请检查环境变量配置"
+
+        cat_map = {
+            "report": CalendarCategory.Report,
+            "earnings": CalendarCategory.Report,
+            "dividend": CalendarCategory.Dividend,
+            "split": CalendarCategory.Split,
+            "ipo": CalendarCategory.Ipo,
+            "macro": CalendarCategory.MacroData,
+            "macrodata": CalendarCategory.MacroData,
+            "closed": CalendarCategory.Closed,
+            "meeting": CalendarCategory.Meeting,
+        }
+        cat = cat_map.get((category or "report").lower())
+        if cat is None:
+            return "[X] 无效 category，可用: report/dividend/split/ipo/macro/closed/meeting"
+
+        today = date.today()
+        start = start_date or today.isoformat()
+        end = end_date or (today + timedelta(days=14)).isoformat()
+
+        kwargs = {"category": cat, "start": start, "end": end, "count": count}
+        if market:
+            kwargs["market"] = market.upper()
+
+        resp = ctx.finance_calendar(**kwargs)
+        groups = getattr(resp, "list", None) or []
+        results = [f"**财经日历 [{category}] {start} ~ {end}**"]
+        if not groups:
+            results.append("  (无事件)")
+            return "\n".join(results)
+
+        shown = 0
+        for group in groups:
+            gdate = getattr(group, "date", "")
+            infos = getattr(group, "infos", None) or []
+            results.append(f"  {gdate} ({len(infos)} 条)")
+            for info in infos:
+                sym = getattr(info, "symbol", "") or getattr(info, "counter_name", "")
+                content = getattr(info, "content", "") or getattr(info, "event_type", "")
+                results.append(f"    - {sym}: {content}")
+                shown += 1
+                if shown >= count:
+                    break
+            if shown >= count:
+                break
+        return "\n".join(results)
+    except Exception as e:
+        return f"[X] 财经日历查询错误: {e}"
+
+
+
 # ------------------------------------------
 # 工具 39: 检查 SDK 状态
 # ------------------------------------------
@@ -3186,15 +3440,16 @@ def check_sdk_status() -> str:
 
     # SDK 状态
     if HAS_SDK:
-        results.append("  [OK] longport SDK 已安装")
+        results.append("  [OK] longbridge SDK 已安装")
         ctx = get_quote_context()
         if ctx:
             results.append("  [OK] SDK QuoteContext 已初始化")
         else:
-            results.append("  [X] SDK QuoteContext 初始化失败")
+            results.append("  [X] SDK QuoteContext 初始化失败（需有效凭证）")
+        results.append(f"  REST Base URL: {BASE_URL}")
     else:
-        results.append("  [X] longport SDK 未安装")
-        results.append("      安装命令: pip install longport")
+        results.append("  [X] longbridge SDK 未安装")
+        results.append("      安装命令: pip install longbridge")
 
     # yfinance 状态
     if HAS_YFINANCE:

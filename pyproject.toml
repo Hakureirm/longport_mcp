@@ -1,14 +1,14 @@
 [project]
 name = "longport-mcp"
-version = "0.3.0"
-description = "Longport Trading MCP Server - REST API + SDK hybrid"
+version = "0.4.0"
+description = "Longport/Longbridge Trading MCP Server - REST API + SDK hybrid"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Hakureirm"}
 ]
-keywords = ["mcp", "longport", "trading", "stock", "api"]
+keywords = ["mcp", "longport", "longbridge", "trading", "stock", "api"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -17,14 +17,15 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "requests>=2.28.0",
     "apscheduler>=3.10.0",
     "yfinance>=0.2.0",
-    "longport>=1.0.0",
+    "longbridge>=5.2.2",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +34,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
 ]
 minimal = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "requests>=2.28.0",
     "apscheduler>=3.10.0",
 ]
@@ -54,4 +55,9 @@ include = [
     "README.md",
     "pyproject.toml",
     "longport_config.json.example",
+    "tests",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -4,9 +4,9 @@
       "command": "uvx",
       "args": ["longport-mcp"],
       "env": {
-        "LONGPORT_APP_KEY": "${LONGPORT_APP_KEY}",
-        "LONGPORT_APP_SECRET": "${LONGPORT_APP_SECRET}",
-        "LONGPORT_ACCESS_TOKEN": "${LONGPORT_ACCESS_TOKEN}"
+        "LONGBRIDGE_APP_KEY": "${LONGBRIDGE_APP_KEY}",
+        "LONGBRIDGE_APP_SECRET": "${LONGBRIDGE_APP_SECRET}",
+        "LONGBRIDGE_ACCESS_TOKEN": "${LONGBRIDGE_ACCESS_TOKEN}"
       }
     }
   }
