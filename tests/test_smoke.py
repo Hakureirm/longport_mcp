@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import importlib
 import os
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+
+
+def _clear_longbridge_env():
+    for key in list(os.environ):
+        if key.startswith(("LONGPORT_", "LONGBRIDGE_")):
+            os.environ.pop(key, None)
 
 
 def test_import_module():
@@ -16,15 +24,10 @@ def test_import_module():
 
 
 def test_tools_register_without_credentials():
-    # Ensure no credentials are present so client init stays lazy/fails only on use
-    for key in list(os.environ):
-        if key.startswith(("LONGPORT_", "LONGBRIDGE_")):
-            os.environ.pop(key, None)
-
+    _clear_longbridge_env()
     mod = importlib.reload(importlib.import_module("longport_mcp_web"))
     mcp = mod.mcp
 
-    # FastMCP stores tools on _tool_manager._tools in recent versions
     tools = None
     if hasattr(mcp, "_tool_manager") and hasattr(mcp._tool_manager, "_tools"):
         tools = mcp._tool_manager._tools
@@ -43,6 +46,8 @@ def test_tools_register_without_credentials():
         "get_market_status",
         "get_company_info",
         "get_finance_calendar",
+        "oauth_login",
+        "oauth_status",
     }
     missing = expected - names
     assert not missing, f"Missing tools: {missing}"
@@ -74,3 +79,87 @@ def test_paper_header_on_rest_client(monkeypatch):
     client = mod.LongportClient(mode="paper")
     headers = client._build_headers("GET", "/v1/asset/account")
     assert headers.get("x-papertrading") == "true"
+
+
+def test_auth_mode_none_without_credentials(monkeypatch):
+    _clear_longbridge_env()
+    mod = importlib.reload(importlib.import_module("longport_mcp_web"))
+    monkeypatch.setattr(mod, "_oauth_handle", None)
+    assert mod.get_auth_mode() == "none"
+
+
+def test_auth_mode_oauth_pending_with_client_id(monkeypatch):
+    _clear_longbridge_env()
+    monkeypatch.setenv("LONGBRIDGE_OAUTH_CLIENT_ID", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    mod = importlib.reload(importlib.import_module("longport_mcp_web"))
+    monkeypatch.setattr(mod, "_oauth_handle", None)
+    monkeypatch.setattr(mod, "_oauth_token_exists", lambda client_id=None: False)
+    assert mod.get_auth_mode() == "oauth_pending"
+    status = mod.oauth_status()
+    assert "oauth_pending" in status
+    assert "oauth_login" in status
+
+
+def test_auth_mode_apikey_fallback(monkeypatch):
+    _clear_longbridge_env()
+    monkeypatch.setenv("LONGBRIDGE_APP_KEY", "k")
+    monkeypatch.setenv("LONGBRIDGE_APP_SECRET", "s")
+    monkeypatch.setenv("LONGBRIDGE_ACCESS_TOKEN", "t")
+    mod = importlib.reload(importlib.import_module("longport_mcp_web"))
+    monkeypatch.setattr(mod, "_oauth_handle", None)
+    monkeypatch.setattr(mod, "_oauth_token_exists", lambda client_id=None: False)
+    assert mod.get_auth_mode() == "apikey"
+
+
+def test_auth_mode_oauth_when_token_on_disk(monkeypatch, tmp_path):
+    _clear_longbridge_env()
+    cid = "oauth-client-smoke-test"
+    monkeypatch.setenv("LONGBRIDGE_OAUTH_CLIENT_ID", cid)
+    mod = importlib.reload(importlib.import_module("longport_mcp_web"))
+    token_dir = tmp_path / "tokens" / cid
+    token_dir.mkdir(parents=True)
+    (token_dir / "access.json").write_text('{"access_token":"fake"}')
+    monkeypatch.setattr(mod, "_oauth_token_path", lambda client_id=None: token_dir)
+    monkeypatch.setattr(mod, "_oauth_handle", None)
+    # _oauth_token_exists uses path — rebind to use tmp_path
+    def _exists(client_id=None):
+        p = token_dir
+        return p.exists() and any(p.iterdir())
+
+    monkeypatch.setattr(mod, "_oauth_token_exists", _exists)
+    assert mod.get_auth_mode() == "oauth"
+
+
+def test_oauth_login_without_client_id(monkeypatch):
+    _clear_longbridge_env()
+    mod = importlib.reload(importlib.import_module("longport_mcp_web"))
+    msg = mod.oauth_login()
+    assert "未配置" in msg or "client_id" in msg.lower() or "LONGBRIDGE_OAUTH_CLIENT_ID" in msg
+
+
+def test_build_sdk_config_prefers_oauth(monkeypatch):
+    pytest.importorskip("longbridge")
+    mod = importlib.import_module("longport_mcp_web")
+    if not mod.HAS_SDK:
+        pytest.skip("longbridge SDK not installed")
+
+    fake_oauth = object()
+    captured = {}
+
+    def fake_from_oauth(oauth, **kwargs):
+        captured["oauth"] = oauth
+        captured["kwargs"] = kwargs
+        return MagicMock(name="Config")
+
+    monkeypatch.setattr(mod, "_ensure_oauth", lambda interactive=False: fake_oauth)
+    monkeypatch.setattr(mod.Config, "from_oauth", staticmethod(fake_from_oauth))
+    cfg = mod._build_sdk_config("paper")
+    assert cfg is not None
+    assert captured["oauth"] is fake_oauth
+    assert captured["kwargs"].get("enable_papertrading") is True
+
+
+def test_oauth_rest_client_shares_business_methods():
+    mod = importlib.import_module("longport_mcp_web")
+    for name in ("get_account_balance", "submit_order", "get_quote", "estimate_buy_limit"):
+        assert hasattr(mod.OAuthRestClient, name), f"OAuthRestClient missing {name}"

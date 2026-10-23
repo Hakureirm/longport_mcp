@@ -3,13 +3,12 @@
 Longport MCP Server - Hybrid Version
 =====================================
 长桥 / Longbridge 证券 MCP 服务，支持 REST API + SDK 混合模式。
-- REST API: 交易、资产、持仓、订单（HMAC 签名；模拟盘附带 x-papertrading）
-- SDK (可选, longbridge>=5.x): 行情深度/K线、资金流向、基本面/日历/市场状态等
+- 认证（推荐）: OAuth 2.0（Bearer，LONGBRIDGE_OAUTH_CLIENT_ID + oauth_login）
+- 认证（兼容）: 传统 API Key HMAC（LONGBRIDGE_APP_KEY/SECRET/ACCESS_TOKEN）
+- REST: OAuth 走 HttpClient Bearer；API Key 走 HMAC（模拟盘附带 x-papertrading）
+- SDK (longbridge>=5.x): 行情/基本面/日历等；OAuth 用 Config.from_oauth
 
-配置方式（LONGBRIDGE_* 优先，LONGPORT_* 仍兼容）：
-1. 环境变量: LONGBRIDGE_APP_KEY / LONGBRIDGE_APP_SECRET / LONGBRIDGE_ACCESS_TOKEN
-   双账户: LONGBRIDGE_PAPER_* 与 LONGBRIDGE_REAL_*
-2. 配置文件: longport_config.json
+配置：环境变量 LONGBRIDGE_*（LONGPORT_* 兼容）或 longport_config.json
 """
 
 import sys
@@ -49,6 +48,8 @@ try:
         FundamentalContext,
         MarketContext,
         PortfolioContext,
+        OAuthBuilder,
+        HttpClient,
     )
     HAS_SDK = True
 except ImportError:
@@ -56,6 +57,10 @@ except ImportError:
     Config = QuoteContext = TradeContext = Market = Period = AdjustType = None  # type: ignore
     CalendarContext = CalendarCategory = FundamentalContext = None  # type: ignore
     MarketContext = PortfolioContext = None  # type: ignore
+    OAuthBuilder = HttpClient = None  # type: ignore
+
+import threading
+from pathlib import Path as _Path
 
 # ================= 配置区域 =================
 logging.basicConfig(
@@ -83,6 +88,346 @@ def _env(*names: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+
+# ================= OAuth / 认证状态 =================
+_oauth_handle = None  # longbridge.openapi.OAuth
+_oauth_client_id_cached: Optional[str] = None
+_oauth_login_thread: Optional[threading.Thread] = None
+_oauth_pending_url: Optional[str] = None
+_oauth_last_error: Optional[str] = None
+_oauth_login_state: str = "idle"  # idle | waiting_browser | ready | error
+_oauth_rest_clients: Dict[str, Any] = {}
+_DEFAULT_OAUTH_CALLBACK_PORT = 60355
+
+
+def _load_json_config() -> Dict[str, Any]:
+    """读取 longport_config.json（若存在）。"""
+    paths_to_try = [
+        CONFIG_FILE,
+        os.path.join(os.path.dirname(__file__), CONFIG_FILE),
+        os.path.expanduser(f"~/{CONFIG_FILE}"),
+        "/etc/longport/config.json",
+    ]
+    for path in paths_to_try:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+            except Exception as e:
+                logger.warning(f"无法读取配置文件 {path}: {e}")
+    return {}
+
+
+def _oauth_client_id() -> str:
+    """OAuth client_id：环境变量优先，其次配置文件 oauth_client_id。"""
+    global _oauth_client_id_cached
+    env_id = _env("LONGBRIDGE_OAUTH_CLIENT_ID", "LONGPORT_OAUTH_CLIENT_ID")
+    if env_id:
+        _oauth_client_id_cached = env_id
+        return env_id
+    cfg = _load_json_config()
+    oauth_block = cfg.get("oauth") if isinstance(cfg.get("oauth"), dict) else {}
+    cfg_id = str(cfg.get("oauth_client_id") or oauth_block.get("client_id") or "")
+    if cfg_id:
+        _oauth_client_id_cached = cfg_id
+    return cfg_id
+
+
+def _oauth_callback_port() -> int:
+    raw = _env("LONGBRIDGE_OAUTH_CALLBACK_PORT", "LONGPORT_OAUTH_CALLBACK_PORT")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    cfg = _load_json_config()
+    try:
+        return int(cfg.get("oauth_callback_port") or _DEFAULT_OAUTH_CALLBACK_PORT)
+    except (TypeError, ValueError):
+        return _DEFAULT_OAUTH_CALLBACK_PORT
+
+
+def _oauth_token_path(client_id: Optional[str] = None) -> _Path:
+    cid = client_id or _oauth_client_id()
+    return _Path.home() / ".longbridge" / "openapi" / "tokens" / (cid or "")
+
+
+def _oauth_token_exists(client_id: Optional[str] = None) -> bool:
+    cid = client_id or _oauth_client_id()
+    if not cid:
+        return False
+    p = _oauth_token_path(cid)
+    if not p.exists():
+        return False
+    if p.is_file():
+        return p.stat().st_size > 0
+    try:
+        return any(p.iterdir())
+    except OSError:
+        return False
+
+
+def _has_apikey_credentials(mode: Optional[str] = None) -> bool:
+    """是否具备传统 API Key 三件套（当前模式或通用）。"""
+    mode = mode or globals().get("_current_mode", "paper")
+    mode_upper = str(mode).upper()
+    key = _env(
+        f"LONGBRIDGE_{mode_upper}_APP_KEY",
+        f"LONGPORT_{mode_upper}_APP_KEY",
+        "LONGBRIDGE_APP_KEY",
+        "LONGPORT_APP_KEY",
+    )
+    secret = _env(
+        f"LONGBRIDGE_{mode_upper}_APP_SECRET",
+        f"LONGPORT_{mode_upper}_APP_SECRET",
+        "LONGBRIDGE_APP_SECRET",
+        "LONGPORT_APP_SECRET",
+    )
+    token = _env(
+        f"LONGBRIDGE_{mode_upper}_ACCESS_TOKEN",
+        f"LONGPORT_{mode_upper}_ACCESS_TOKEN",
+        "LONGBRIDGE_ACCESS_TOKEN",
+        "LONGPORT_ACCESS_TOKEN",
+    )
+    if key and secret and token:
+        return True
+    cfg = _load_json_config()
+    if mode in cfg and isinstance(cfg.get(mode), dict):
+        m = cfg[mode]
+        if m.get("app_key") and m.get("app_secret") and m.get("access_token"):
+            return True
+    if cfg.get("app_key") and cfg.get("app_secret") and cfg.get("access_token"):
+        return True
+    return False
+
+
+def get_auth_mode() -> str:
+    """
+    返回当前认证模式：
+    - oauth: OAuth 已就绪（内存句柄或磁盘 token）
+    - oauth_pending: 已配置 client_id 但尚未授权
+    - apikey: 传统 API Key
+    - none: 无可用凭证
+    """
+    cid = _oauth_client_id()
+    if cid and (_oauth_handle is not None or _oauth_token_exists(cid)):
+        return "oauth"
+    if _has_apikey_credentials():
+        return "apikey"
+    if cid:
+        return "oauth_pending"
+    return "none"
+
+
+def _clear_auth_caches() -> None:
+    """登录完成或切换账户后清理 SDK / REST 缓存。"""
+    global _sdk_ctx_cache, _oauth_rest_clients, _paper_client, _real_client
+    _sdk_ctx_cache = {"paper": {}, "real": {}}
+    _oauth_rest_clients = {}
+    _paper_client = None
+    _real_client = None
+
+
+def _set_oauth_handle(handle) -> None:
+    global _oauth_handle, _oauth_login_state, _oauth_last_error, _oauth_pending_url
+    _oauth_handle = handle
+    _oauth_login_state = "ready"
+    _oauth_last_error = None
+    _oauth_pending_url = None
+    _clear_auth_caches()
+
+
+def _ensure_oauth(interactive: bool = False):
+    """
+    获取 OAuth 句柄。
+
+    interactive=False：仅在已有缓存 token / 句柄时返回，否则 None（不弹浏览器）。
+    interactive=True：阻塞执行授权（供后台线程调用）。
+    """
+    global _oauth_handle, _oauth_last_error, _oauth_pending_url, _oauth_login_state
+
+    if not HAS_SDK or OAuthBuilder is None:
+        return None
+
+    cid = _oauth_client_id()
+    if not cid:
+        return None
+
+    if _oauth_handle is not None:
+        return _oauth_handle
+
+    if not interactive and not _oauth_token_exists(cid):
+        return None
+
+    def on_open_url(url: str) -> None:
+        global _oauth_pending_url, _oauth_login_state
+        _oauth_pending_url = url
+        _oauth_login_state = "waiting_browser"
+        logger.info(f"OAuth authorize URL: {url}")
+        sys.stderr.write(f"\n[OAuth] 请在浏览器打开授权链接:\n{url}\n\n")
+        sys.stderr.flush()
+
+    try:
+        needs_browser = interactive or not _oauth_token_exists(cid)
+        _oauth_login_state = "waiting_browser" if needs_browser else "idle"
+        builder = OAuthBuilder(cid, callback_port=_oauth_callback_port())
+        handle = builder.build(on_open_url)
+        _set_oauth_handle(handle)
+        return handle
+    except Exception as e:
+        _oauth_last_error = str(e)
+        _oauth_login_state = "error"
+        logger.error(f"OAuth 初始化失败: {e}")
+        if interactive:
+            raise
+        return None
+
+
+def _start_oauth_login_background() -> str:
+    """非阻塞启动 OAuth 浏览器流程，返回提示文案。"""
+    global _oauth_login_thread, _oauth_pending_url, _oauth_last_error, _oauth_login_state
+
+    cid = _oauth_client_id()
+    if not cid:
+        return (
+            "[X] 未配置 OAuth client_id。\n"
+            "  1) curl 注册客户端（见 README）\n"
+            "  2) 设置 LONGBRIDGE_OAUTH_CLIENT_ID=...\n"
+            "  3) 再次调用 oauth_login"
+        )
+    if not HAS_SDK:
+        return "[X] 需要 longbridge SDK: pip install longbridge"
+
+    if _oauth_token_exists(cid) or _oauth_handle is not None:
+        try:
+            handle = _ensure_oauth(interactive=False)
+            if handle is None:
+                handle = _ensure_oauth(interactive=True)
+            return (
+                f"[OK] OAuth 已就绪（client_id={cid[:8]}...）\n"
+                f"  Token 路径: {_oauth_token_path(cid)}\n"
+                f"  当前模式: {get_current_mode()}（paper 时启用 enable_papertrading / x-papertrading）"
+            )
+        except Exception as e:
+            return f"[X] 复用 OAuth token 失败: {e}"
+
+    if _oauth_login_thread and _oauth_login_thread.is_alive():
+        if _oauth_pending_url:
+            return (
+                f"[i] OAuth 授权进行中，请在浏览器打开:\n{_oauth_pending_url}\n"
+                f"  回调端口: {_oauth_callback_port()}（需与注册 redirect_uris 一致）\n"
+                f"  完成后调用 oauth_status 确认"
+            )
+        return "[i] OAuth 授权线程已在运行，请稍候再调用 oauth_status"
+
+    _oauth_pending_url = None
+    _oauth_last_error = None
+    _oauth_login_state = "waiting_browser"
+
+    def worker():
+        global _oauth_last_error, _oauth_login_state
+        try:
+            _ensure_oauth(interactive=True)
+        except Exception as e:
+            _oauth_last_error = str(e)
+            _oauth_login_state = "error"
+
+    _oauth_login_thread = threading.Thread(
+        target=worker, name="longbridge-oauth-login", daemon=True
+    )
+    _oauth_login_thread.start()
+
+    for _ in range(50):
+        if _oauth_pending_url or _oauth_login_state in ("ready", "error"):
+            break
+        time.sleep(0.1)
+
+    if _oauth_pending_url:
+        return (
+            "**OAuth 授权已启动**\n"
+            f"  client_id: {cid}\n"
+            f"  请在浏览器打开以下链接完成授权（首次需要交互）:\n"
+            f"  {_oauth_pending_url}\n\n"
+            f"  本地回调: http://localhost:{_oauth_callback_port()}/callback\n"
+            f"  Token 将保存到: {_oauth_token_path(cid)}\n"
+            f"  授权完成后调用 oauth_status；后续启动会自动复用 token。"
+        )
+    if _oauth_login_state == "ready":
+        return "[OK] OAuth 授权完成"
+    if _oauth_last_error:
+        return f"[X] OAuth 启动失败: {_oauth_last_error}"
+    return (
+        "[i] OAuth 线程已启动，授权 URL 稍后可用。\n"
+        "  请稍后调用 oauth_status；并确保本机可监听回调端口。"
+    )
+
+
+class OAuthRestClient:
+    """
+    OAuth 模式下的 REST 适配器（Bearer，无 HMAC）。
+    接口与 LongportClient 的 get/post/put/delete 及业务封装对齐。
+    """
+
+    def __init__(self, oauth, mode: str = "paper"):
+        if not HAS_SDK or HttpClient is None:
+            raise RuntimeError("longbridge HttpClient 不可用")
+        self.mode = mode
+        self.app_key = "(oauth)"
+        self.app_secret = ""
+        self.access_token = "(oauth)"
+        self.config: Dict[str, Any] = {"auth": "oauth"}
+        http_url = _env("LONGBRIDGE_HTTP_URL", "LONGPORT_HTTP_URL", default=BASE_URL) or None
+        self._http = HttpClient.from_oauth(oauth, http_url=http_url)
+
+    def _paper_headers(self) -> Optional[Dict[str, str]]:
+        if self.mode == "paper":
+            return {"x-papertrading": "true"}
+        return None
+
+    def _wrap(self, resp: Any) -> Dict[str, Any]:
+        if resp is None:
+            return {"code": 0, "data": None}
+        if isinstance(resp, dict):
+            if "code" in resp:
+                code = resp.get("code", 0)
+                if code not in (0, "0", None):
+                    raise Exception(
+                        f"API 错误 [{code}]: {resp.get('message', '未知错误')}"
+                    )
+                return resp
+            return {"code": 0, "data": resp}
+        return {"code": 0, "data": resp}
+
+    def _path_with_params(self, endpoint: str, params: Optional[Dict[str, Any]]) -> str:
+        if not params:
+            return endpoint
+        filtered = {k: v for k, v in params.items() if v is not None}
+        sorted_params = sorted(filtered.items())
+        params_str = "&".join(f"{k}={v}" for k, v in sorted_params)
+        return f"{endpoint}?{params_str}" if params_str else endpoint
+
+    def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        path = self._path_with_params(endpoint, params)
+        return self._wrap(self._http.request("get", path, headers=self._paper_headers()))
+
+    def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._wrap(
+            self._http.request("post", endpoint, headers=self._paper_headers(), body=data)
+        )
+
+    def put(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._wrap(
+            self._http.request("put", endpoint, headers=self._paper_headers(), body=data)
+        )
+
+    def delete(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        path = self._path_with_params(endpoint, params)
+        return self._wrap(self._http.request("delete", path, headers=self._paper_headers()))
+
 
 # 订单类型映射
 ORDER_TYPE_MAP = {
@@ -803,6 +1148,21 @@ class LongportClient:
 
 
 
+
+# 让 OAuthRestClient 复用 LongportClient 的业务封装（仅依赖 get/post/put/delete）
+for _name in [
+    "get_account_balance", "get_stock_positions", "submit_order", "cancel_order",
+    "get_today_orders", "get_order_detail", "get_quote", "replace_order",
+    "get_history_orders", "get_today_executions", "get_history_executions",
+    "get_fund_positions", "get_cash_flow", "get_margin_ratio", "get_candlesticks",
+    "get_depth", "get_brokers", "get_trades", "get_intraday", "get_static_info",
+    "get_warrant_quote", "get_option_quote", "get_option_chain_dates", "get_option_chain",
+    "get_warrant_issuers", "get_warrant_filter", "estimate_buy_limit",
+]:
+    if hasattr(LongportClient, _name) and not hasattr(OAuthRestClient, _name):
+        setattr(OAuthRestClient, _name, getattr(LongportClient, _name))
+
+
 # ================= 全局客户端实例 =================
 _current_mode: str = "paper"  # 当前账户模式: "paper" 或 "real"
 _paper_client: Optional[LongportClient] = None
@@ -850,16 +1210,43 @@ def set_current_mode(mode: str) -> bool:
     Returns:
         是否成功
     """
-    global _current_mode
+    global _current_mode, _sdk_ctx_cache, _oauth_rest_clients
     if mode not in ["paper", "real"]:
         return False
-    _current_mode = mode
+    if mode != _current_mode:
+        _current_mode = mode
+        # 切换模拟盘/实盘时重建 SDK / OAuth REST（papertrading 标志不同）
+        _sdk_ctx_cache = {"paper": {}, "real": {}}
+        _oauth_rest_clients = {}
+    else:
+        _current_mode = mode
     return True
 
 
-def get_client() -> LongportClient:
-    """获取当前模式的 REST API 客户端实例（懒加载）"""
-    global _paper_client, _real_client, _current_mode
+def get_client():
+    """
+    获取当前模式的 REST 客户端（懒加载）。
+
+    优先 OAuth（HttpClient Bearer）；否则传统 API Key HMAC LongportClient。
+    """
+    global _paper_client, _real_client, _oauth_rest_clients, _current_mode
+
+    auth = get_auth_mode()
+    if auth == "oauth":
+        oauth = _ensure_oauth(interactive=False)
+        if oauth is None:
+            raise ValueError(
+                "OAuth client_id 已配置但尚未完成授权，请先调用 oauth_login"
+            )
+        if _current_mode not in _oauth_rest_clients:
+            _oauth_rest_clients[_current_mode] = OAuthRestClient(oauth, mode=_current_mode)
+        return _oauth_rest_clients[_current_mode]
+
+    if auth == "oauth_pending" and not _has_apikey_credentials(_current_mode):
+        raise ValueError(
+            "已配置 LONGBRIDGE_OAUTH_CLIENT_ID，但尚未授权且无 API Key。"
+            "请调用 oauth_login 完成浏览器授权。"
+        )
 
     if _current_mode == "paper":
         if _paper_client is None:
@@ -875,14 +1262,24 @@ def _build_sdk_config(mode: Optional[str] = None):
     """
     构建 longbridge SDK Config。
 
-    longbridge 5.x 不再支持 Config(app_key=...) 构造，必须使用 Config.from_apikey。
+    优先 OAuth: Config.from_oauth；否则 API Key: Config.from_apikey。
     模拟盘启用 enable_papertrading，与 REST 的 x-papertrading 头一致。
     """
     if not HAS_SDK:
         return None
     mode = mode or _current_mode
-    client = get_client() if mode == _current_mode else LongportClient(mode=mode)
     http_url = _env("LONGBRIDGE_HTTP_URL", "LONGPORT_HTTP_URL", default=BASE_URL) or None
+
+    oauth = _ensure_oauth(interactive=False)
+    if oauth is not None:
+        return Config.from_oauth(
+            oauth,
+            http_url=http_url,
+            enable_papertrading=(mode == "paper"),
+            enable_print_quote_packages=False,
+        )
+
+    client = LongportClient(mode=mode)
     return Config.from_apikey(
         client.app_key,
         client.app_secret,
@@ -3425,6 +3822,67 @@ def get_finance_calendar(
 
 
 
+
+# ------------------------------------------
+# 工具: OAuth 状态
+# ------------------------------------------
+@mcp.tool()
+def oauth_status() -> str:
+    """
+    查看 OAuth / API Key 认证状态（无需敏感信息明文）。
+
+    Returns:
+        认证模式、client_id 是否配置、token 是否已缓存、登录进度
+    """
+    cid = _oauth_client_id()
+    auth = get_auth_mode()
+    results = ["**认证状态**"]
+    results.append(f"  模式: {auth}")
+    results.append(f"  账户: {get_current_mode()} (paper/real)")
+    results.append(f"  REST Base: {BASE_URL}")
+    if cid:
+        masked = f"{cid[:8]}...{cid[-4:]}" if len(cid) > 12 else cid
+        results.append(f"  OAuth client_id: {masked}")
+        results.append(
+            f"  Token 缓存: {'是' if _oauth_token_exists(cid) else '否'} ({_oauth_token_path(cid)})"
+        )
+    else:
+        results.append("  OAuth client_id: 未配置（设置 LONGBRIDGE_OAUTH_CLIENT_ID）")
+    results.append(f"  OAuth 句柄: {'已加载' if _oauth_handle is not None else '未加载'}")
+    results.append(f"  登录状态: {_oauth_login_state}")
+    if _oauth_pending_url:
+        results.append(f"  待打开授权 URL:\n  {_oauth_pending_url}")
+    if _oauth_last_error:
+        results.append(f"  最近错误: {_oauth_last_error}")
+    results.append(f"  API Key 凭证: {'可用' if _has_apikey_credentials() else '无'}")
+    if auth == "oauth_pending":
+        results.append("\n  → 请调用 oauth_login 完成首次浏览器授权")
+    elif auth == "none":
+        results.append("\n  → 推荐 OAuth：注册 client 后设置 LONGBRIDGE_OAUTH_CLIENT_ID 并 oauth_login")
+        results.append("  → 或配置传统 LONGBRIDGE_APP_KEY/SECRET/ACCESS_TOKEN")
+    return "\n".join(results)
+
+
+# ------------------------------------------
+# 工具: OAuth 登录
+# ------------------------------------------
+@mcp.tool()
+def oauth_login() -> str:
+    """
+    启动 Longbridge OAuth 2.0 授权（推荐认证方式）。
+
+    首次运行会返回浏览器授权 URL（本地回调 http://localhost:60355/callback）。
+    授权成功后 token 持久化到 ~/.longbridge/openapi/tokens/<client_id>，
+    之后自动复用并刷新，无需重复登录。
+
+    前置：设置环境变量 LONGBRIDGE_OAUTH_CLIENT_ID（或配置文件 oauth_client_id）。
+
+    Returns:
+        授权 URL 或就绪状态说明
+    """
+    return _start_oauth_login_background()
+
+
 # ------------------------------------------
 # 工具 39: 检查 SDK 状态
 # ------------------------------------------
@@ -3438,14 +3896,26 @@ def check_sdk_status() -> str:
     """
     results = ["**模块状态检查**"]
 
+    results.append(f"  认证模式: {get_auth_mode()}")
+    cid = _oauth_client_id()
+    if cid:
+        results.append(
+            f"  OAuth: client_id 已配置, token={'有' if _oauth_token_exists(cid) else '无'}"
+        )
+    else:
+        results.append("  OAuth: 未配置 client_id（推荐设置 LONGBRIDGE_OAUTH_CLIENT_ID）")
+
     # SDK 状态
     if HAS_SDK:
         results.append("  [OK] longbridge SDK 已安装")
-        ctx = get_quote_context()
-        if ctx:
-            results.append("  [OK] SDK QuoteContext 已初始化")
+        if get_auth_mode() in ("oauth", "apikey"):
+            ctx = get_quote_context()
+            if ctx:
+                results.append("  [OK] SDK QuoteContext 已初始化")
+            else:
+                results.append("  [X] SDK QuoteContext 初始化失败（需有效凭证）")
         else:
-            results.append("  [X] SDK QuoteContext 初始化失败（需有效凭证）")
+            results.append("  [i] SDK 已安装，等待 oauth_login 或 API Key")
         results.append(f"  REST Base URL: {BASE_URL}")
     else:
         results.append("  [X] longbridge SDK 未安装")
@@ -3460,11 +3930,13 @@ def check_sdk_status() -> str:
     # REST API 状态
     try:
         client = get_client()
-        results.append("  [OK] REST API 客户端已初始化")
+        kind = "OAuth Bearer" if isinstance(client, OAuthRestClient) else "API Key HMAC"
+        results.append(f"  [OK] REST 客户端已初始化 ({kind})")
     except Exception as e:
-        results.append(f"  [X] REST API 初始化失败: {e}")
+        results.append(f"  [X] REST 初始化失败: {e}")
 
     return "\n".join(results)
+
 
 
 # ------------------------------------------
