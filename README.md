@@ -11,6 +11,12 @@
 - **yfinance 备用**: 行情数据支持 yfinance 作为备用源，可查询加密货币
 - **uvx 一键部署**: 无需复杂配置
 
+## 0.5.2 更新说明 / Changelog (Paper Auth)
+
+- **模拟盘优先 API Key**：若配置了 `LONGBRIDGE_PAPER_*`，`get_auth_mode` / SDK 对 paper 模式优先走 HMAC，不再被 OAuth token 抢先
+- 原因：OAuth 授权后交易接口常落到空账本（`account_channel=lb`），而 App 模拟盘对应 `lb_papertrading`，需用模拟盘 Access Token
+- 可用 `LONGBRIDGE_AUTH_PREFER=oauth|apikey` 强制覆盖
+
 ## 0.5.1 更新说明 / Changelog (CI)
 
 - 新增 GitHub Actions CI（`.github/workflows/ci.yml`）：多版本 unit smoke + 可选 paper 联调

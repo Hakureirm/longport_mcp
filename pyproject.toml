@@ -1,6 +1,6 @@
 [project]
 name = "longport-mcp"
-version = "0.5.1"
+version = "0.5.2"
 description = "Longport/Longbridge Trading MCP Server - OAuth 2.0 + REST/SDK hybrid"
 readme = "README.md"
 requires-python = ">=3.10"

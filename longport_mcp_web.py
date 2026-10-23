@@ -212,11 +212,30 @@ def get_auth_mode() -> str:
     - oauth_pending: 已配置 client_id 但尚未授权
     - apikey: 传统 API Key
     - none: 无可用凭证
+
+    注意：模拟盘若配置了 LONGBRIDGE_PAPER_* API Key，优先走 apikey。
+    OAuth 授权常落在另一套空账本（account_channel=lb），而 App 模拟盘
+    对应 papertrading 通道（lb_papertrading），需用模拟盘 Access Token。
+    可用 LONGBRIDGE_AUTH_PREFER=oauth|apikey 强制覆盖。
     """
+    prefer = (_env("LONGBRIDGE_AUTH_PREFER", "LONGPORT_AUTH_PREFER") or "").strip().lower()
+    mode = globals().get("_current_mode", "paper")
     cid = _oauth_client_id()
-    if cid and (_oauth_handle is not None or _oauth_token_exists(cid)):
+    oauth_ready = bool(cid and (_oauth_handle is not None or _oauth_token_exists(cid)))
+    apikey_ready = _has_apikey_credentials(mode)
+
+    if prefer == "apikey" and apikey_ready:
+        return "apikey"
+    if prefer == "oauth" and oauth_ready:
         return "oauth"
-    if _has_apikey_credentials():
+
+    # 模拟盘：有 PAPER_* 时优先 API Key，避免 OAuth 空账本掩盖真实模拟资金
+    if mode == "paper" and apikey_ready:
+        return "apikey"
+
+    if oauth_ready:
+        return "oauth"
+    if apikey_ready:
         return "apikey"
     if cid:
         return "oauth_pending"
@@ -1269,6 +1288,20 @@ def _build_sdk_config(mode: Optional[str] = None):
         return None
     mode = mode or _current_mode
     http_url = _env("LONGBRIDGE_HTTP_URL", "LONGPORT_HTTP_URL", default=BASE_URL) or None
+
+    # 与 get_auth_mode 对齐：模拟盘有 API Key 时不要用 OAuth 建 SDK Config
+    if get_auth_mode() == "apikey" or (
+        mode == "paper" and _has_apikey_credentials("paper")
+    ):
+        client = LongportClient(mode=mode)
+        return Config.from_apikey(
+            client.app_key,
+            client.app_secret,
+            client.access_token,
+            http_url=http_url,
+            enable_papertrading=(mode == "paper"),
+            enable_print_quote_packages=False,
+        )
 
     oauth = _ensure_oauth(interactive=False)
     if oauth is not None:
