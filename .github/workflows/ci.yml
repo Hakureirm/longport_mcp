@@ -10,6 +10,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   unit:
     name: unit (py${{ matrix.python-version }})
@@ -26,6 +29,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install package (dev)
         run: |
@@ -38,10 +42,9 @@ jobs:
   paper-integration:
     name: paper-integration
     runs-on: ubuntu-latest
-    # Same-repo PRs / pushes only see secrets; forks get empty → job skipped.
-    # Owner: add LONGBRIDGE_PAPER_* under Settings → Secrets and variables → Actions.
-    if: ${{ secrets.LONGBRIDGE_PAPER_ACCESS_TOKEN != '' }}
     needs: unit
+    # Do not gate on secrets in job-level `if` (can fail the whole workflow).
+    # Skip inside the job when paper secrets are unset.
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +53,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install package (dev)
         run: |
@@ -64,6 +68,10 @@ jobs:
           LONGBRIDGE_DEFAULT_MODE: paper
           LONGBRIDGE_HTTP_URL: ${{ secrets.LONGBRIDGE_HTTP_URL }}
           LONGBRIDGE_REGION: ${{ secrets.LONGBRIDGE_REGION }}
-          # Opt-in only; leave unset so CI never places orders.
           LONGBRIDGE_PAPER_ALLOW_ORDER: ${{ secrets.LONGBRIDGE_PAPER_ALLOW_ORDER }}
-        run: pytest -q -m integration
+        run: |
+          if [ -z "${LONGBRIDGE_PAPER_ACCESS_TOKEN}" ]; then
+            echo "No LONGBRIDGE_PAPER_ACCESS_TOKEN secret — skipping paper integration."
+            exit 0
+          fi
+          pytest -q -m integration
