@@ -2,13 +2,13 @@
 """
 Longport MCP Server - Hybrid Version
 =====================================
-长桥证券 MCP 服务，支持 REST API + SDK 混合模式。
-- REST API: 交易、资产、持仓、订单
-- SDK (可选): 交易日历、资金流向、实时推送等高级功能
+长桥 / Longbridge 证券 MCP 服务，支持 REST API + SDK 混合模式。
+- 认证（推荐）: OAuth 2.0（Bearer，LONGBRIDGE_OAUTH_CLIENT_ID + oauth_login）
+- 认证（兼容）: 传统 API Key HMAC（LONGBRIDGE_APP_KEY/SECRET/ACCESS_TOKEN）
+- REST: OAuth 走 HttpClient Bearer；API Key 走 HMAC（模拟盘附带 x-papertrading）
+- SDK (longbridge>=5.x): 行情/基本面/日历等；OAuth 用 Config.from_oauth
 
-配置方式：
-1. 环境变量（推荐）: LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
-2. 配置文件: longport_config.json
+配置：环境变量 LONGBRIDGE_*（LONGPORT_* 兼容）或 longport_config.json
 """
 
 import sys
@@ -34,12 +34,33 @@ try:
 except ImportError:
     HAS_YFINANCE = False
 
-# 尝试导入 longport SDK（用于高级功能）
+# 尝试导入 longbridge SDK（原 PyPI 包 longport 已更名为 longbridge）
 try:
-    from longport.openapi import Config, QuoteContext, TradeContext, Market, Period, AdjustType
+    from longbridge.openapi import (
+        Config,
+        QuoteContext,
+        TradeContext,
+        Market,
+        Period,
+        AdjustType,
+        CalendarContext,
+        CalendarCategory,
+        FundamentalContext,
+        MarketContext,
+        PortfolioContext,
+        OAuthBuilder,
+        HttpClient,
+    )
     HAS_SDK = True
 except ImportError:
     HAS_SDK = False
+    Config = QuoteContext = TradeContext = Market = Period = AdjustType = None  # type: ignore
+    CalendarContext = CalendarCategory = FundamentalContext = None  # type: ignore
+    MarketContext = PortfolioContext = None  # type: ignore
+    OAuthBuilder = HttpClient = None  # type: ignore
+
+import threading
+from pathlib import Path as _Path
 
 # ================= 配置区域 =================
 logging.basicConfig(
@@ -51,8 +72,381 @@ logger = logging.getLogger("longport_mcp")
 # ===========================================
 
 # ================= 常量定义 =================
-BASE_URL = "https://openapi.longportapp.com"
+# 官方 HTTP 主机已迁移至 openapi.longbridge.com（可用环境变量覆盖）
+BASE_URL = (
+    os.getenv("LONGBRIDGE_HTTP_URL")
+    or os.getenv("LONGPORT_HTTP_URL")
+    or "https://openapi.longbridge.com"
+)
 CONFIG_FILE = "longport_config.json"
+
+
+def _env(*names: str, default: str = "") -> str:
+    """按优先级读取环境变量（支持 LONGBRIDGE_* / LONGPORT_* 双前缀）。"""
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
+
+# ================= OAuth / 认证状态 =================
+_oauth_handle = None  # longbridge.openapi.OAuth
+_oauth_client_id_cached: Optional[str] = None
+_oauth_login_thread: Optional[threading.Thread] = None
+_oauth_pending_url: Optional[str] = None
+_oauth_last_error: Optional[str] = None
+_oauth_login_state: str = "idle"  # idle | waiting_browser | ready | error
+_oauth_rest_clients: Dict[str, Any] = {}
+_DEFAULT_OAUTH_CALLBACK_PORT = 60355
+
+
+def _load_json_config() -> Dict[str, Any]:
+    """读取 longport_config.json（若存在）。"""
+    paths_to_try = [
+        CONFIG_FILE,
+        os.path.join(os.path.dirname(__file__), CONFIG_FILE),
+        os.path.expanduser(f"~/{CONFIG_FILE}"),
+        "/etc/longport/config.json",
+    ]
+    for path in paths_to_try:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+            except Exception as e:
+                logger.warning(f"无法读取配置文件 {path}: {e}")
+    return {}
+
+
+def _oauth_client_id() -> str:
+    """OAuth client_id：环境变量优先，其次配置文件 oauth_client_id。"""
+    global _oauth_client_id_cached
+    env_id = _env("LONGBRIDGE_OAUTH_CLIENT_ID", "LONGPORT_OAUTH_CLIENT_ID")
+    if env_id:
+        _oauth_client_id_cached = env_id
+        return env_id
+    cfg = _load_json_config()
+    oauth_block = cfg.get("oauth") if isinstance(cfg.get("oauth"), dict) else {}
+    cfg_id = str(cfg.get("oauth_client_id") or oauth_block.get("client_id") or "")
+    if cfg_id:
+        _oauth_client_id_cached = cfg_id
+    return cfg_id
+
+
+def _oauth_callback_port() -> int:
+    raw = _env("LONGBRIDGE_OAUTH_CALLBACK_PORT", "LONGPORT_OAUTH_CALLBACK_PORT")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    cfg = _load_json_config()
+    try:
+        return int(cfg.get("oauth_callback_port") or _DEFAULT_OAUTH_CALLBACK_PORT)
+    except (TypeError, ValueError):
+        return _DEFAULT_OAUTH_CALLBACK_PORT
+
+
+def _oauth_token_path(client_id: Optional[str] = None) -> _Path:
+    cid = client_id or _oauth_client_id()
+    return _Path.home() / ".longbridge" / "openapi" / "tokens" / (cid or "")
+
+
+def _oauth_token_exists(client_id: Optional[str] = None) -> bool:
+    cid = client_id or _oauth_client_id()
+    if not cid:
+        return False
+    p = _oauth_token_path(cid)
+    if not p.exists():
+        return False
+    if p.is_file():
+        return p.stat().st_size > 0
+    try:
+        return any(p.iterdir())
+    except OSError:
+        return False
+
+
+def _has_apikey_credentials(mode: Optional[str] = None) -> bool:
+    """是否具备传统 API Key 三件套（当前模式或通用）。"""
+    mode = mode or globals().get("_current_mode", "paper")
+    mode_upper = str(mode).upper()
+    key = _env(
+        f"LONGBRIDGE_{mode_upper}_APP_KEY",
+        f"LONGPORT_{mode_upper}_APP_KEY",
+        "LONGBRIDGE_APP_KEY",
+        "LONGPORT_APP_KEY",
+    )
+    secret = _env(
+        f"LONGBRIDGE_{mode_upper}_APP_SECRET",
+        f"LONGPORT_{mode_upper}_APP_SECRET",
+        "LONGBRIDGE_APP_SECRET",
+        "LONGPORT_APP_SECRET",
+    )
+    token = _env(
+        f"LONGBRIDGE_{mode_upper}_ACCESS_TOKEN",
+        f"LONGPORT_{mode_upper}_ACCESS_TOKEN",
+        "LONGBRIDGE_ACCESS_TOKEN",
+        "LONGPORT_ACCESS_TOKEN",
+    )
+    if key and secret and token:
+        return True
+    cfg = _load_json_config()
+    if mode in cfg and isinstance(cfg.get(mode), dict):
+        m = cfg[mode]
+        if m.get("app_key") and m.get("app_secret") and m.get("access_token"):
+            return True
+    if cfg.get("app_key") and cfg.get("app_secret") and cfg.get("access_token"):
+        return True
+    return False
+
+
+def get_auth_mode() -> str:
+    """
+    返回当前认证模式：
+    - oauth: OAuth 已就绪（内存句柄或磁盘 token）
+    - oauth_pending: 已配置 client_id 但尚未授权
+    - apikey: 传统 API Key
+    - none: 无可用凭证
+
+    注意：模拟盘若配置了 LONGBRIDGE_PAPER_* API Key，优先走 apikey。
+    OAuth 授权常落在另一套空账本（account_channel=lb），而 App 模拟盘
+    对应 papertrading 通道（lb_papertrading），需用模拟盘 Access Token。
+    可用 LONGBRIDGE_AUTH_PREFER=oauth|apikey 强制覆盖。
+    """
+    prefer = (_env("LONGBRIDGE_AUTH_PREFER", "LONGPORT_AUTH_PREFER") or "").strip().lower()
+    mode = globals().get("_current_mode", "paper")
+    cid = _oauth_client_id()
+    oauth_ready = bool(cid and (_oauth_handle is not None or _oauth_token_exists(cid)))
+    apikey_ready = _has_apikey_credentials(mode)
+
+    if prefer == "apikey" and apikey_ready:
+        return "apikey"
+    if prefer == "oauth" and oauth_ready:
+        return "oauth"
+
+    # 模拟盘：有 PAPER_* 时优先 API Key，避免 OAuth 空账本掩盖真实模拟资金
+    if mode == "paper" and apikey_ready:
+        return "apikey"
+
+    if oauth_ready:
+        return "oauth"
+    if apikey_ready:
+        return "apikey"
+    if cid:
+        return "oauth_pending"
+    return "none"
+
+
+def _clear_auth_caches() -> None:
+    """登录完成或切换账户后清理 SDK / REST 缓存。"""
+    global _sdk_ctx_cache, _oauth_rest_clients, _paper_client, _real_client
+    _sdk_ctx_cache = {"paper": {}, "real": {}}
+    _oauth_rest_clients = {}
+    _paper_client = None
+    _real_client = None
+
+
+def _set_oauth_handle(handle) -> None:
+    global _oauth_handle, _oauth_login_state, _oauth_last_error, _oauth_pending_url
+    _oauth_handle = handle
+    _oauth_login_state = "ready"
+    _oauth_last_error = None
+    _oauth_pending_url = None
+    _clear_auth_caches()
+
+
+def _ensure_oauth(interactive: bool = False):
+    """
+    获取 OAuth 句柄。
+
+    interactive=False：仅在已有缓存 token / 句柄时返回，否则 None（不弹浏览器）。
+    interactive=True：阻塞执行授权（供后台线程调用）。
+    """
+    global _oauth_handle, _oauth_last_error, _oauth_pending_url, _oauth_login_state
+
+    if not HAS_SDK or OAuthBuilder is None:
+        return None
+
+    cid = _oauth_client_id()
+    if not cid:
+        return None
+
+    if _oauth_handle is not None:
+        return _oauth_handle
+
+    if not interactive and not _oauth_token_exists(cid):
+        return None
+
+    def on_open_url(url: str) -> None:
+        global _oauth_pending_url, _oauth_login_state
+        _oauth_pending_url = url
+        _oauth_login_state = "waiting_browser"
+        logger.info(f"OAuth authorize URL: {url}")
+        sys.stderr.write(f"\n[OAuth] 请在浏览器打开授权链接:\n{url}\n\n")
+        sys.stderr.flush()
+
+    try:
+        needs_browser = interactive or not _oauth_token_exists(cid)
+        _oauth_login_state = "waiting_browser" if needs_browser else "idle"
+        builder = OAuthBuilder(cid, callback_port=_oauth_callback_port())
+        handle = builder.build(on_open_url)
+        _set_oauth_handle(handle)
+        return handle
+    except Exception as e:
+        _oauth_last_error = str(e)
+        _oauth_login_state = "error"
+        logger.error(f"OAuth 初始化失败: {e}")
+        if interactive:
+            raise
+        return None
+
+
+def _start_oauth_login_background() -> str:
+    """非阻塞启动 OAuth 浏览器流程，返回提示文案。"""
+    global _oauth_login_thread, _oauth_pending_url, _oauth_last_error, _oauth_login_state
+
+    cid = _oauth_client_id()
+    if not cid:
+        return (
+            "[X] 未配置 OAuth client_id。\n"
+            "  1) curl 注册客户端（见 README）\n"
+            "  2) 设置 LONGBRIDGE_OAUTH_CLIENT_ID=...\n"
+            "  3) 再次调用 oauth_login"
+        )
+    if not HAS_SDK:
+        return "[X] 需要 longbridge SDK: pip install longbridge"
+
+    if _oauth_token_exists(cid) or _oauth_handle is not None:
+        try:
+            handle = _ensure_oauth(interactive=False)
+            if handle is None:
+                handle = _ensure_oauth(interactive=True)
+            return (
+                f"[OK] OAuth 已就绪（client_id={cid[:8]}...）\n"
+                f"  Token 路径: {_oauth_token_path(cid)}\n"
+                f"  当前模式: {get_current_mode()}（paper 时启用 enable_papertrading / x-papertrading）"
+            )
+        except Exception as e:
+            return f"[X] 复用 OAuth token 失败: {e}"
+
+    if _oauth_login_thread and _oauth_login_thread.is_alive():
+        if _oauth_pending_url:
+            return (
+                f"[i] OAuth 授权进行中，请在浏览器打开:\n{_oauth_pending_url}\n"
+                f"  回调端口: {_oauth_callback_port()}（需与注册 redirect_uris 一致）\n"
+                f"  完成后调用 oauth_status 确认"
+            )
+        return "[i] OAuth 授权线程已在运行，请稍候再调用 oauth_status"
+
+    _oauth_pending_url = None
+    _oauth_last_error = None
+    _oauth_login_state = "waiting_browser"
+
+    def worker():
+        global _oauth_last_error, _oauth_login_state
+        try:
+            _ensure_oauth(interactive=True)
+        except Exception as e:
+            _oauth_last_error = str(e)
+            _oauth_login_state = "error"
+
+    _oauth_login_thread = threading.Thread(
+        target=worker, name="longbridge-oauth-login", daemon=True
+    )
+    _oauth_login_thread.start()
+
+    for _ in range(50):
+        if _oauth_pending_url or _oauth_login_state in ("ready", "error"):
+            break
+        time.sleep(0.1)
+
+    if _oauth_pending_url:
+        return (
+            "**OAuth 授权已启动**\n"
+            f"  client_id: {cid}\n"
+            f"  请在浏览器打开以下链接完成授权（首次需要交互）:\n"
+            f"  {_oauth_pending_url}\n\n"
+            f"  本地回调: http://localhost:{_oauth_callback_port()}/callback\n"
+            f"  Token 将保存到: {_oauth_token_path(cid)}\n"
+            f"  授权完成后调用 oauth_status；后续启动会自动复用 token。"
+        )
+    if _oauth_login_state == "ready":
+        return "[OK] OAuth 授权完成"
+    if _oauth_last_error:
+        return f"[X] OAuth 启动失败: {_oauth_last_error}"
+    return (
+        "[i] OAuth 线程已启动，授权 URL 稍后可用。\n"
+        "  请稍后调用 oauth_status；并确保本机可监听回调端口。"
+    )
+
+
+class OAuthRestClient:
+    """
+    OAuth 模式下的 REST 适配器（Bearer，无 HMAC）。
+    接口与 LongportClient 的 get/post/put/delete 及业务封装对齐。
+    """
+
+    def __init__(self, oauth, mode: str = "paper"):
+        if not HAS_SDK or HttpClient is None:
+            raise RuntimeError("longbridge HttpClient 不可用")
+        self.mode = mode
+        self.app_key = "(oauth)"
+        self.app_secret = ""
+        self.access_token = "(oauth)"
+        self.config: Dict[str, Any] = {"auth": "oauth"}
+        http_url = _env("LONGBRIDGE_HTTP_URL", "LONGPORT_HTTP_URL", default=BASE_URL) or None
+        self._http = HttpClient.from_oauth(oauth, http_url=http_url)
+
+    def _paper_headers(self) -> Optional[Dict[str, str]]:
+        if self.mode == "paper":
+            return {"x-papertrading": "true"}
+        return None
+
+    def _wrap(self, resp: Any) -> Dict[str, Any]:
+        if resp is None:
+            return {"code": 0, "data": None}
+        if isinstance(resp, dict):
+            if "code" in resp:
+                code = resp.get("code", 0)
+                if code not in (0, "0", None):
+                    raise Exception(
+                        f"API 错误 [{code}]: {resp.get('message', '未知错误')}"
+                    )
+                return resp
+            return {"code": 0, "data": resp}
+        return {"code": 0, "data": resp}
+
+    def _path_with_params(self, endpoint: str, params: Optional[Dict[str, Any]]) -> str:
+        if not params:
+            return endpoint
+        filtered = {k: v for k, v in params.items() if v is not None}
+        sorted_params = sorted(filtered.items())
+        params_str = "&".join(f"{k}={v}" for k, v in sorted_params)
+        return f"{endpoint}?{params_str}" if params_str else endpoint
+
+    def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        path = self._path_with_params(endpoint, params)
+        return self._wrap(self._http.request("get", path, headers=self._paper_headers()))
+
+    def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._wrap(
+            self._http.request("post", endpoint, headers=self._paper_headers(), body=data)
+        )
+
+    def put(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._wrap(
+            self._http.request("put", endpoint, headers=self._paper_headers(), body=data)
+        )
+
+    def delete(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        path = self._path_with_params(endpoint, params)
+        return self._wrap(self._http.request("delete", path, headers=self._paper_headers()))
+
 
 # 订单类型映射
 ORDER_TYPE_MAP = {
@@ -126,13 +520,13 @@ class LongportClient:
             config_path: 配置文件路径，默认为当前目录下的 longport_config.json
             mode: 账户模式，"paper"=模拟盘，"real"=实盘
 
-        支持的环境变量（双账户模式）：
-            LONGPORT_PAPER_APP_KEY, LONGPORT_PAPER_APP_SECRET, LONGPORT_PAPER_ACCESS_TOKEN
-            LONGPORT_REAL_APP_KEY, LONGPORT_REAL_APP_SECRET, LONGPORT_REAL_ACCESS_TOKEN
-            LONGPORT_DEFAULT_MODE (可选，默认 "paper")
+        支持的环境变量（双账户模式，LONGBRIDGE_* 优先，LONGPORT_* 兼容）：
+            LONGBRIDGE_PAPER_* / LONGPORT_PAPER_* (APP_KEY / APP_SECRET / ACCESS_TOKEN)
+            LONGBRIDGE_REAL_* / LONGPORT_REAL_* (APP_KEY / APP_SECRET / ACCESS_TOKEN)
+            LONGBRIDGE_DEFAULT_MODE / LONGPORT_DEFAULT_MODE (可选，默认 "paper")
 
-        也支持旧的单账户环境变量：
-            LONGPORT_APP_KEY, LONGPORT_APP_SECRET, LONGPORT_ACCESS_TOKEN
+        也支持单账户环境变量：
+            LONGBRIDGE_APP_KEY / LONGPORT_APP_KEY 及对应 SECRET / TOKEN
         """
         self.mode = mode
         self.config = self._load_config(config_path)
@@ -153,11 +547,26 @@ class LongportClient:
         # 如果配置文件没有，尝试环境变量（带模式前缀）
         mode_upper = mode.upper()
         if not self.app_key:
-            self.app_key = os.getenv(f"LONGPORT_{mode_upper}_APP_KEY") or os.getenv("LONGPORT_APP_KEY")
+            self.app_key = _env(
+                f"LONGBRIDGE_{mode_upper}_APP_KEY",
+                f"LONGPORT_{mode_upper}_APP_KEY",
+                "LONGBRIDGE_APP_KEY",
+                "LONGPORT_APP_KEY",
+            )
         if not self.app_secret:
-            self.app_secret = os.getenv(f"LONGPORT_{mode_upper}_APP_SECRET") or os.getenv("LONGPORT_APP_SECRET")
+            self.app_secret = _env(
+                f"LONGBRIDGE_{mode_upper}_APP_SECRET",
+                f"LONGPORT_{mode_upper}_APP_SECRET",
+                "LONGBRIDGE_APP_SECRET",
+                "LONGPORT_APP_SECRET",
+            )
         if not self.access_token:
-            self.access_token = os.getenv(f"LONGPORT_{mode_upper}_ACCESS_TOKEN") or os.getenv("LONGPORT_ACCESS_TOKEN")
+            self.access_token = _env(
+                f"LONGBRIDGE_{mode_upper}_ACCESS_TOKEN",
+                f"LONGPORT_{mode_upper}_ACCESS_TOKEN",
+                "LONGBRIDGE_ACCESS_TOKEN",
+                "LONGPORT_ACCESS_TOKEN",
+            )
 
         if not all([self.app_key, self.app_secret, self.access_token]):
             raise ValueError(f"缺少必要的配置 ({mode}): app_key, app_secret, access_token")
@@ -239,13 +648,17 @@ class LongportClient:
         """构建请求头"""
         timestamp, signature = self._generate_signature(method, uri, params, body)
 
-        return {
+        headers = {
             "X-Api-Key": self.app_key,
             "Authorization": self.access_token,
             "X-Timestamp": timestamp,
             "X-Api-Signature": signature,
-            "Content-Type": "application/json; charset=utf-8"
+            "Content-Type": "application/json; charset=utf-8",
         }
+        # 与 SDK enable_papertrading 对齐：模拟盘 REST 请求声明纸交易环境
+        if getattr(self, "mode", "paper") == "paper":
+            headers["x-papertrading"] = "true"
+        return headers
 
     def _handle_response(self, response: requests.Response) -> Dict[str, Any]:
         """
@@ -754,18 +1167,33 @@ class LongportClient:
 
 
 
+
+# 让 OAuthRestClient 复用 LongportClient 的业务封装（仅依赖 get/post/put/delete）
+for _name in [
+    "get_account_balance", "get_stock_positions", "submit_order", "cancel_order",
+    "get_today_orders", "get_order_detail", "get_quote", "replace_order",
+    "get_history_orders", "get_today_executions", "get_history_executions",
+    "get_fund_positions", "get_cash_flow", "get_margin_ratio", "get_candlesticks",
+    "get_depth", "get_brokers", "get_trades", "get_intraday", "get_static_info",
+    "get_warrant_quote", "get_option_quote", "get_option_chain_dates", "get_option_chain",
+    "get_warrant_issuers", "get_warrant_filter", "estimate_buy_limit",
+]:
+    if hasattr(LongportClient, _name) and not hasattr(OAuthRestClient, _name):
+        setattr(OAuthRestClient, _name, getattr(LongportClient, _name))
+
+
 # ================= 全局客户端实例 =================
 _current_mode: str = "paper"  # 当前账户模式: "paper" 或 "real"
 _paper_client: Optional[LongportClient] = None
 _real_client: Optional[LongportClient] = None
-_paper_quote_ctx = None  # SDK QuoteContext for paper trading
-_real_quote_ctx = None   # SDK QuoteContext for real trading
+# SDK contexts cache: mode -> {quote, calendar, fundamental, market, portfolio}
+_sdk_ctx_cache: Dict[str, Dict[str, Any]] = {"paper": {}, "real": {}}
 
 
 def _load_default_mode() -> str:
     """从环境变量或配置文件加载默认模式"""
     # 优先使用环境变量
-    env_mode = os.getenv("LONGPORT_DEFAULT_MODE", "").lower()
+    env_mode = _env("LONGBRIDGE_DEFAULT_MODE", "LONGPORT_DEFAULT_MODE").lower()
     if env_mode in ["paper", "real"]:
         return env_mode
 
@@ -801,16 +1229,43 @@ def set_current_mode(mode: str) -> bool:
     Returns:
         是否成功
     """
-    global _current_mode
+    global _current_mode, _sdk_ctx_cache, _oauth_rest_clients
     if mode not in ["paper", "real"]:
         return False
-    _current_mode = mode
+    if mode != _current_mode:
+        _current_mode = mode
+        # 切换模拟盘/实盘时重建 SDK / OAuth REST（papertrading 标志不同）
+        _sdk_ctx_cache = {"paper": {}, "real": {}}
+        _oauth_rest_clients = {}
+    else:
+        _current_mode = mode
     return True
 
 
-def get_client() -> LongportClient:
-    """获取当前模式的 REST API 客户端实例（懒加载）"""
-    global _paper_client, _real_client, _current_mode
+def get_client():
+    """
+    获取当前模式的 REST 客户端（懒加载）。
+
+    优先 OAuth（HttpClient Bearer）；否则传统 API Key HMAC LongportClient。
+    """
+    global _paper_client, _real_client, _oauth_rest_clients, _current_mode
+
+    auth = get_auth_mode()
+    if auth == "oauth":
+        oauth = _ensure_oauth(interactive=False)
+        if oauth is None:
+            raise ValueError(
+                "OAuth client_id 已配置但尚未完成授权，请先调用 oauth_login"
+            )
+        if _current_mode not in _oauth_rest_clients:
+            _oauth_rest_clients[_current_mode] = OAuthRestClient(oauth, mode=_current_mode)
+        return _oauth_rest_clients[_current_mode]
+
+    if auth == "oauth_pending" and not _has_apikey_credentials(_current_mode):
+        raise ValueError(
+            "已配置 LONGBRIDGE_OAUTH_CLIENT_ID，但尚未授权且无 API Key。"
+            "请调用 oauth_login 完成浏览器授权。"
+        )
 
     if _current_mode == "paper":
         if _paper_client is None:
@@ -822,46 +1277,91 @@ def get_client() -> LongportClient:
         return _real_client
 
 
-def get_quote_context():
-    """获取当前模式的 SDK QuoteContext 实例（懒加载）"""
-    global _paper_quote_ctx, _real_quote_ctx, _current_mode
+def _build_sdk_config(mode: Optional[str] = None):
+    """
+    构建 longbridge SDK Config。
+
+    优先 OAuth: Config.from_oauth；否则 API Key: Config.from_apikey。
+    模拟盘启用 enable_papertrading，与 REST 的 x-papertrading 头一致。
+    """
+    if not HAS_SDK:
+        return None
+    mode = mode or _current_mode
+    http_url = _env("LONGBRIDGE_HTTP_URL", "LONGPORT_HTTP_URL", default=BASE_URL) or None
+
+    # 与 get_auth_mode 对齐：模拟盘有 API Key 时不要用 OAuth 建 SDK Config
+    if get_auth_mode() == "apikey" or (
+        mode == "paper" and _has_apikey_credentials("paper")
+    ):
+        client = LongportClient(mode=mode)
+        return Config.from_apikey(
+            client.app_key,
+            client.app_secret,
+            client.access_token,
+            http_url=http_url,
+            enable_papertrading=(mode == "paper"),
+            enable_print_quote_packages=False,
+        )
+
+    oauth = _ensure_oauth(interactive=False)
+    if oauth is not None:
+        return Config.from_oauth(
+            oauth,
+            http_url=http_url,
+            enable_papertrading=(mode == "paper"),
+            enable_print_quote_packages=False,
+        )
+
+    client = LongportClient(mode=mode)
+    return Config.from_apikey(
+        client.app_key,
+        client.app_secret,
+        client.access_token,
+        http_url=http_url,
+        enable_papertrading=(mode == "paper"),
+        enable_print_quote_packages=False,
+    )
+
+
+def _get_sdk_context(kind: str):
+    """懒加载当前模式的 SDK Context（quote/calendar/fundamental/market/portfolio）。"""
+    global _sdk_ctx_cache, _current_mode
 
     if not HAS_SDK:
         return None
 
-    # 根据当前模式选择对应的 context
-    if _current_mode == "paper":
-        if _paper_quote_ctx is None:
-            try:
-                client = get_client()
-                logger.info(f"SDK初始化 (paper): app_key={client.app_key[:8] if client.app_key else 'None'}...")
-                config = Config(
-                    app_key=client.app_key,
-                    app_secret=client.app_secret,
-                    access_token=client.access_token
-                )
-                _paper_quote_ctx = QuoteContext(config)
-                logger.info("SDK QuoteContext (paper) 初始化成功")
-            except Exception as e:
-                logger.error(f"SDK QuoteContext (paper) 初始化失败: {e}")
-                return None
-        return _paper_quote_ctx
-    else:
-        if _real_quote_ctx is None:
-            try:
-                client = get_client()
-                logger.info(f"SDK初始化 (real): app_key={client.app_key[:8] if client.app_key else 'None'}...")
-                config = Config(
-                    app_key=client.app_key,
-                    app_secret=client.app_secret,
-                    access_token=client.access_token
-                )
-                _real_quote_ctx = QuoteContext(config)
-                logger.info("SDK QuoteContext (real) 初始化成功")
-            except Exception as e:
-                logger.error(f"SDK QuoteContext (real) 初始化失败: {e}")
-                return None
-        return _real_quote_ctx
+    bucket = _sdk_ctx_cache.setdefault(_current_mode, {})
+    if kind in bucket:
+        return bucket[kind]
+
+    factories = {
+        "quote": QuoteContext,
+        "calendar": CalendarContext,
+        "fundamental": FundamentalContext,
+        "market": MarketContext,
+        "portfolio": PortfolioContext,
+    }
+    cls = factories.get(kind)
+    if cls is None:
+        return None
+
+    try:
+        config = _build_sdk_config(_current_mode)
+        if config is None:
+            return None
+        logger.info(f"SDK {cls.__name__} 初始化 ({_current_mode})...")
+        ctx = cls(config)
+        bucket[kind] = ctx
+        logger.info(f"SDK {cls.__name__} ({_current_mode}) 初始化成功")
+        return ctx
+    except Exception as e:
+        logger.error(f"SDK {cls.__name__} ({_current_mode}) 初始化失败: {e}")
+        return None
+
+
+def get_quote_context():
+    """获取当前模式的 SDK QuoteContext 实例（懒加载）"""
+    return _get_sdk_context("quote")
 
 
 # 初始化时加载默认模式
@@ -2093,6 +2593,28 @@ def get_margin_ratio(symbol: str) -> str:
         return f"[X] 保证金查询错误: {e}"
 
 
+
+def _resolve_sdk_period(period: str):
+    """将用户周期字符串映射为 SDK Period（区分 1m 分钟与 1M 月）。"""
+    if not HAS_SDK or Period is None:
+        raise RuntimeError("longbridge SDK unavailable")
+    raw = (period or "1d").strip()
+    key = raw.lower()
+    # 月线常用 1M / M / mon —— 避免被 lower() 成 1m 后误判为 1 分钟
+    if raw in ("1M", "M") or key in ("month", "mon", "1mo", "monthly"):
+        return Period.Month
+    period_map = {
+        "1m": Period.Min_1, "1min": Period.Min_1, "min": Period.Min_1,
+        "5m": Period.Min_5, "15m": Period.Min_15,
+        "30m": Period.Min_30, "60m": Period.Min_60, "1h": Period.Min_60,
+        "2h": Period.Min_120, "4h": Period.Min_240,
+        "1d": Period.Day, "day": Period.Day, "daily": Period.Day, "d": Period.Day,
+        "1w": Period.Week, "week": Period.Week, "weekly": Period.Week, "w": Period.Week,
+        "1q": Period.Quarter, "quarter": Period.Quarter, "q": Period.Quarter,
+        "1y": Period.Year, "year": Period.Year, "yearly": Period.Year, "y": Period.Year,
+    }
+    return period_map.get(key, Period.Day)
+
 # ------------------------------------------
 # 工具 23: 获取K线数据（SDK优先，yfinance备用）
 # ------------------------------------------
@@ -2120,16 +2642,7 @@ def get_candlesticks(
         try:
             ctx = get_quote_context()
             if ctx is not None:
-                # SDK Period 映射
-                period_map = {
-                    "1m": Period.Min_1, "5m": Period.Min_5, "15m": Period.Min_15,
-                    "30m": Period.Min_30, "60m": Period.Min_60,
-                    "1d": Period.Day, "day": Period.Day,
-                    "1w": Period.Week, "week": Period.Week,
-                    "1M": Period.Month, "month": Period.Month,
-                    "1y": Period.Year, "year": Period.Year,
-                }
-                sdk_period = period_map.get(period.lower(), Period.Day)
+                sdk_period = _resolve_sdk_period(period)
 
                 candles = ctx.candlesticks(target, sdk_period, count, AdjustType.ForwardAdjust)
 
@@ -2310,12 +2823,7 @@ def get_technical_analysis(symbol: str, period: str = "1d", count: int = 60) -> 
             if ctx:
                 try:
                     target = to_sdk_symbol(symbol)
-                    period_map = {
-                        "1m": Period.Min_1, "5m": Period.Min_5, "15m": Period.Min_15,
-                        "30m": Period.Min_30, "1h": Period.Min_60, "4h": Period.Min_60,
-                        "1d": Period.Day, "1w": Period.Week, "1M": Period.Month
-                    }
-                    sdk_period = period_map.get(period, Period.Day)
+                    sdk_period = _resolve_sdk_period(period)
                     candles = ctx.candlesticks(target, sdk_period, count, AdjustType.ForwardAdjust)
                     for c in candles:
                         closes.append(float(c.close))
@@ -2523,7 +3031,7 @@ def get_depth(symbol: str) -> str:
         盘口深度信息
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2566,7 +3074,7 @@ def get_brokers(symbol: str) -> str:
         经纪商队列信息
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2612,7 +3120,7 @@ def get_trades(symbol: str, count: int = 20) -> str:
         成交明细
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2655,7 +3163,7 @@ def get_intraday(symbol: str) -> str:
         分时数据
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -2892,10 +3400,14 @@ def submit_order_advanced(
         resp = client.post("/v1/trade/order", data)
         order_id = resp.get("data", {}).get("order_id")
 
-        return f"[OK] 高级订单已提交，ID: {order_id}"
+        mode = get_current_mode()
+        mode_label = "[模拟盘]" if mode == "paper" else "[实盘]"
+        return f"{mode_label} [OK] 高级订单已提交，ID: {order_id}"
 
     except Exception as e:
-        return f"[X] 高级下单失败: {e}"
+        mode = get_current_mode()
+        mode_label = "[模拟盘]" if mode == "paper" else "[实盘]"
+        return f"{mode_label} [X] 高级下单失败: {e}"
 
 
 # ------------------------------------------
@@ -2997,7 +3509,7 @@ def get_current_time() -> str:
 
 
 # ==================== SDK 增强功能 ====================
-# 以下工具需要 longport SDK 支持，提供更丰富的行情数据
+# 以下工具需要 longbridge SDK 支持，提供更丰富的行情数据
 
 # ------------------------------------------
 # 工具 36: 获取交易日历 (SDK)
@@ -3020,7 +3532,7 @@ def get_trading_days(
         交易日列表
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         from datetime import date
@@ -3093,7 +3605,7 @@ def get_capital_flow(symbol: str) -> str:
         资金流向信息
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -3138,7 +3650,7 @@ def get_capital_distribution(symbol: str) -> str:
         资金分布信息（大单/中单/小单）
     """
     if not HAS_SDK:
-        return "[X] 此功能需要 longport SDK，请安装: pip install longport"
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
 
     try:
         ctx = get_quote_context()
@@ -3171,6 +3683,239 @@ def get_capital_distribution(symbol: str) -> str:
         return f"[X] 资金分布查询错误: {e}"
 
 
+
+# ------------------------------------------
+# 工具: 市场交易状态 (SDK MarketContext, longbridge 4.1+)
+# ------------------------------------------
+@mcp.tool()
+def get_market_status() -> str:
+    """
+    获取各市场当前交易状态（需要 longbridge SDK）。
+
+    Returns:
+        各市场交易状态列表
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
+
+    try:
+        ctx = _get_sdk_context("market")
+        if ctx is None:
+            return "[X] SDK MarketContext 初始化失败，请检查环境变量配置"
+
+        resp = ctx.market_status()
+        items = getattr(resp, "market_time", None) or []
+        if not items:
+            return "[i] 无市场状态数据"
+
+        results = ["**市场交易状态**"]
+        for item in items:
+            market = getattr(item, "market", "?")
+            status = getattr(item, "trade_status", "?")
+            ts = getattr(item, "timestamp", "")
+            results.append(f"  {market}: status={status}, ts={ts}")
+        return "\n".join(results)
+    except Exception as e:
+        return f"[X] 市场状态查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具: 公司概览 (SDK FundamentalContext, longbridge 4.1+)
+# ------------------------------------------
+@mcp.tool()
+def get_company_info(symbol: str) -> str:
+    """
+    获取公司概览（需要 longbridge SDK FundamentalContext）。
+
+    Args:
+        symbol: 股票代码，如 700.HK / AAPL.US
+
+    Returns:
+        公司名称、上市信息、简介等
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
+
+    try:
+        ctx = _get_sdk_context("fundamental")
+        if ctx is None:
+            return "[X] SDK FundamentalContext 初始化失败，请检查环境变量配置"
+
+        target = to_sdk_symbol(symbol)
+        info = ctx.company(target)
+        results = [f"**{target} 公司概览**"]
+        mapping = [
+            ("名称", "name"),
+            ("全称", "company_name"),
+            ("市场", "market"),
+            ("地区", "region"),
+            ("成立", "founded"),
+            ("上市", "listing_date"),
+            ("官网", "website"),
+            ("发行价", "issue_price"),
+        ]
+        for label, attr in mapping:
+            val = getattr(info, attr, None)
+            if val:
+                results.append(f"  {label}: {val}")
+        for attr in ("description", "profile", "intro", "business"):
+            val = getattr(info, attr, None)
+            if val:
+                text = str(val).strip()
+                if len(text) > 400:
+                    text = text[:400] + "..."
+                results.append(f"  简介: {text}")
+                break
+        return "\n".join(results) if len(results) > 1 else f"[i] {target} 无公司概览数据"
+    except Exception as e:
+        return f"[X] 公司概览查询错误: {e}"
+
+
+# ------------------------------------------
+# 工具: 财经日历 (SDK CalendarContext, longbridge 4.1+)
+# ------------------------------------------
+@mcp.tool()
+def get_finance_calendar(
+    category: str = "report",
+    start_date: str = "",
+    end_date: str = "",
+    market: str = "",
+    count: int = 20,
+) -> str:
+    """
+    获取财经日历事件（需要 longbridge SDK CalendarContext）。
+
+    Args:
+        category: 事件类型 report/dividend/split/ipo/macro/closed/meeting
+        start_date: 开始日期 YYYY-MM-DD（默认今天）
+        end_date: 结束日期 YYYY-MM-DD（默认 14 天后）
+        market: 可选市场过滤，如 US/HK/CN/SG
+        count: 返回条数上限（默认 20）
+
+    Returns:
+        按日分组的财经事件
+    """
+    if not HAS_SDK:
+        return "[X] 此功能需要 longbridge SDK，请安装: pip install longbridge"
+
+    try:
+        from datetime import date, timedelta
+
+        ctx = _get_sdk_context("calendar")
+        if ctx is None:
+            return "[X] SDK CalendarContext 初始化失败，请检查环境变量配置"
+
+        cat_map = {
+            "report": CalendarCategory.Report,
+            "earnings": CalendarCategory.Report,
+            "dividend": CalendarCategory.Dividend,
+            "split": CalendarCategory.Split,
+            "ipo": CalendarCategory.Ipo,
+            "macro": CalendarCategory.MacroData,
+            "macrodata": CalendarCategory.MacroData,
+            "closed": CalendarCategory.Closed,
+            "meeting": CalendarCategory.Meeting,
+        }
+        cat = cat_map.get((category or "report").lower())
+        if cat is None:
+            return "[X] 无效 category，可用: report/dividend/split/ipo/macro/closed/meeting"
+
+        today = date.today()
+        start = start_date or today.isoformat()
+        end = end_date or (today + timedelta(days=14)).isoformat()
+
+        kwargs = {"category": cat, "start": start, "end": end, "count": count}
+        if market:
+            kwargs["market"] = market.upper()
+
+        resp = ctx.finance_calendar(**kwargs)
+        groups = getattr(resp, "list", None) or []
+        results = [f"**财经日历 [{category}] {start} ~ {end}**"]
+        if not groups:
+            results.append("  (无事件)")
+            return "\n".join(results)
+
+        shown = 0
+        for group in groups:
+            gdate = getattr(group, "date", "")
+            infos = getattr(group, "infos", None) or []
+            results.append(f"  {gdate} ({len(infos)} 条)")
+            for info in infos:
+                sym = getattr(info, "symbol", "") or getattr(info, "counter_name", "")
+                content = getattr(info, "content", "") or getattr(info, "event_type", "")
+                results.append(f"    - {sym}: {content}")
+                shown += 1
+                if shown >= count:
+                    break
+            if shown >= count:
+                break
+        return "\n".join(results)
+    except Exception as e:
+        return f"[X] 财经日历查询错误: {e}"
+
+
+
+
+# ------------------------------------------
+# 工具: OAuth 状态
+# ------------------------------------------
+@mcp.tool()
+def oauth_status() -> str:
+    """
+    查看 OAuth / API Key 认证状态（无需敏感信息明文）。
+
+    Returns:
+        认证模式、client_id 是否配置、token 是否已缓存、登录进度
+    """
+    cid = _oauth_client_id()
+    auth = get_auth_mode()
+    results = ["**认证状态**"]
+    results.append(f"  模式: {auth}")
+    results.append(f"  账户: {get_current_mode()} (paper/real)")
+    results.append(f"  REST Base: {BASE_URL}")
+    if cid:
+        masked = f"{cid[:8]}...{cid[-4:]}" if len(cid) > 12 else cid
+        results.append(f"  OAuth client_id: {masked}")
+        results.append(
+            f"  Token 缓存: {'是' if _oauth_token_exists(cid) else '否'} ({_oauth_token_path(cid)})"
+        )
+    else:
+        results.append("  OAuth client_id: 未配置（设置 LONGBRIDGE_OAUTH_CLIENT_ID）")
+    results.append(f"  OAuth 句柄: {'已加载' if _oauth_handle is not None else '未加载'}")
+    results.append(f"  登录状态: {_oauth_login_state}")
+    if _oauth_pending_url:
+        results.append(f"  待打开授权 URL:\n  {_oauth_pending_url}")
+    if _oauth_last_error:
+        results.append(f"  最近错误: {_oauth_last_error}")
+    results.append(f"  API Key 凭证: {'可用' if _has_apikey_credentials() else '无'}")
+    if auth == "oauth_pending":
+        results.append("\n  → 请调用 oauth_login 完成首次浏览器授权")
+    elif auth == "none":
+        results.append("\n  → 推荐 OAuth：注册 client 后设置 LONGBRIDGE_OAUTH_CLIENT_ID 并 oauth_login")
+        results.append("  → 或配置传统 LONGBRIDGE_APP_KEY/SECRET/ACCESS_TOKEN")
+    return "\n".join(results)
+
+
+# ------------------------------------------
+# 工具: OAuth 登录
+# ------------------------------------------
+@mcp.tool()
+def oauth_login() -> str:
+    """
+    启动 Longbridge OAuth 2.0 授权（推荐认证方式）。
+
+    首次运行会返回浏览器授权 URL（本地回调 http://localhost:60355/callback）。
+    授权成功后 token 持久化到 ~/.longbridge/openapi/tokens/<client_id>，
+    之后自动复用并刷新，无需重复登录。
+
+    前置：设置环境变量 LONGBRIDGE_OAUTH_CLIENT_ID（或配置文件 oauth_client_id）。
+
+    Returns:
+        授权 URL 或就绪状态说明
+    """
+    return _start_oauth_login_background()
+
+
 # ------------------------------------------
 # 工具 39: 检查 SDK 状态
 # ------------------------------------------
@@ -3184,17 +3929,30 @@ def check_sdk_status() -> str:
     """
     results = ["**模块状态检查**"]
 
+    results.append(f"  认证模式: {get_auth_mode()}")
+    cid = _oauth_client_id()
+    if cid:
+        results.append(
+            f"  OAuth: client_id 已配置, token={'有' if _oauth_token_exists(cid) else '无'}"
+        )
+    else:
+        results.append("  OAuth: 未配置 client_id（推荐设置 LONGBRIDGE_OAUTH_CLIENT_ID）")
+
     # SDK 状态
     if HAS_SDK:
-        results.append("  [OK] longport SDK 已安装")
-        ctx = get_quote_context()
-        if ctx:
-            results.append("  [OK] SDK QuoteContext 已初始化")
+        results.append("  [OK] longbridge SDK 已安装")
+        if get_auth_mode() in ("oauth", "apikey"):
+            ctx = get_quote_context()
+            if ctx:
+                results.append("  [OK] SDK QuoteContext 已初始化")
+            else:
+                results.append("  [X] SDK QuoteContext 初始化失败（需有效凭证）")
         else:
-            results.append("  [X] SDK QuoteContext 初始化失败")
+            results.append("  [i] SDK 已安装，等待 oauth_login 或 API Key")
+        results.append(f"  REST Base URL: {BASE_URL}")
     else:
-        results.append("  [X] longport SDK 未安装")
-        results.append("      安装命令: pip install longport")
+        results.append("  [X] longbridge SDK 未安装")
+        results.append("      安装命令: pip install longbridge")
 
     # yfinance 状态
     if HAS_YFINANCE:
@@ -3205,11 +3963,13 @@ def check_sdk_status() -> str:
     # REST API 状态
     try:
         client = get_client()
-        results.append("  [OK] REST API 客户端已初始化")
+        kind = "OAuth Bearer" if isinstance(client, OAuthRestClient) else "API Key HMAC"
+        results.append(f"  [OK] REST 客户端已初始化 ({kind})")
     except Exception as e:
-        results.append(f"  [X] REST API 初始化失败: {e}")
+        results.append(f"  [X] REST 初始化失败: {e}")
 
     return "\n".join(results)
+
 
 
 # ------------------------------------------

@@ -1,4 +1,7 @@
 {
+    "oauth_client_id": "your-oauth-client-id",
+    "oauth_callback_port": 60355,
+    "default_mode": "paper",
     "paper": {
         "app_key": "your_paper_app_key",
         "app_secret": "your_paper_app_secret",
@@ -8,6 +11,5 @@
         "app_key": "your_real_app_key",
         "app_secret": "your_real_app_secret",
         "access_token": "your_real_access_token"
-    },
-    "default_mode": "paper"
+    }
 }
